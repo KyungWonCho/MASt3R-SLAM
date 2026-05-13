@@ -1,0 +1,12 @@
+inherit: "config/eval_calib.yaml"
+
+# Phase 1+2 fusion variant: calibrated weight (c^0.74) + cap on accumulated
+# precision + innovation-based variance inflation. See notes/diag_findings.md
+# for the empirical justification.
+tracking:
+  filtering_mode: weighted_pointmap_calib
+  fusion:
+    w_exp: 0.74          # calibrated: -2 · p_meas with p_meas ≈ -0.37
+    cap: 200.0           # cap on accumulated W; prevents freeze (§11 in diag summary)
+    innov_rel: 0.3       # gate triggers if |X - X_canon| > 0.3 · depth at a pixel
+    innov_inflate: 4.0   # gated pixels: W ← W / 4 (fast correction for early-wrong)

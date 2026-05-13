@@ -24,6 +24,10 @@ class Frame:
     T_WC: lietorch.Sim3 = lietorch.Sim3.Identity(1)
     X_canon: Optional[torch.Tensor] = None
     C: Optional[torch.Tensor] = None
+    # Calibrated accumulated precision for filtering_mode=="weighted_pointmap_calib".
+    # Kept separate from C so downstream conf thresholds (which expect raw c) stay
+    # backwards compatible. W is per-pixel.
+    W: Optional[torch.Tensor] = None
     feat: Optional[torch.Tensor] = None
     pos: Optional[torch.Tensor] = None
     N: int = 0
@@ -73,6 +77,46 @@ class Frame:
             self.N = 1
         elif filtering_mode == "weighted_pointmap":
             self.X_canon = ((self.C * self.X_canon) + (C * X)) / (self.C + C)
+            self.C = self.C + C
+            self.N += 1
+        elif filtering_mode == "weighted_pointmap_calib":
+            # Calibrated weighted fusion with cap and innovation-based variance
+            # inflation. Derived from the 7-Scenes diag finding σ ∝ c^p with
+            # p ≈ -0.37 (cross-scene aggregate). Three knobs:
+            #   w_exp:        weight exponent (= -2 p_meas ≈ 0.74). raw c is wrong.
+            #   cap:          ceiling on accumulated precision W; without it,
+            #                 gain → 0 after ~10 updates and the keyframe
+            #                 freezes on its early predictions.
+            #   innov_rel:    if a new obs disagrees with X_canon by more than
+            #                 innov_rel × depth at a pixel, that pixel's W is
+            #                 divided by innov_inflate — the system "forgets"
+            #                 the prior locally so the new obs takes over fast.
+            #                 Set to <=0 to disable.
+            fcfg = config["tracking"].get("fusion", {})
+            w_exp = fcfg.get("w_exp", 0.74)
+            cap = fcfg.get("cap", 200.0)
+            innov_rel = fcfg.get("innov_rel", 0.3)
+            innov_inflate = fcfg.get("innov_inflate", 4.0)
+
+            w_new = C.clamp(min=1e-6) ** w_exp
+            # First call into this branch: convert N==0 init (which stored raw C)
+            # to the calibrated accumulator.
+            if self.W is None:
+                self.W = (self.C.clamp(min=1e-6) ** w_exp).clamp(max=cap)
+
+            # Innovation gating: per-pixel relative residual.
+            if innov_rel > 0:
+                residual = (X - self.X_canon).norm(dim=-1, keepdim=True)
+                depth_scale = self.X_canon.norm(dim=-1, keepdim=True).clamp(min=1e-3)
+                gate = (residual / depth_scale > innov_rel).to(self.W.dtype)
+                # Where gate fires: W ← W / innov_inflate  (forget more of the prior)
+                self.W = self.W * (1.0 - gate * (1.0 - 1.0 / innov_inflate))
+
+            denom = self.W + w_new
+            self.X_canon = (self.W * self.X_canon + w_new * X) / denom
+            self.W = (self.W + w_new).clamp(max=cap)
+            # Also accumulate raw C so frame.get_average_conf() / downstream
+            # thresholds keep working unchanged.
             self.C = self.C + C
             self.N += 1
         elif filtering_mode == "weighted_spherical":

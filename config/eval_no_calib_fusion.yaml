@@ -1,0 +1,9 @@
+inherit: "config/eval_no_calib.yaml"
+
+tracking:
+  filtering_mode: weighted_pointmap_calib
+  fusion:
+    w_exp: 0.74
+    cap: 200.0
+    innov_rel: 0.3
+    innov_inflate: 4.0
