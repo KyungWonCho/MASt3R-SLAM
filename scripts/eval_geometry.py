@@ -193,9 +193,47 @@ def main():
     p.add_argument("--no-icp", action="store_true", help="skip ICP refinement")
     p.add_argument("--all-frames-gt", action="store_true",
                    help="use every frame for GT (default: only SLAM keyframe timestamps, matches paper)")
+    p.add_argument("--force", action="store_true",
+                   help="recompute even if eval.json cache exists.")
+    p.add_argument("--cache-name", default="eval.json",
+                   help="filename for cached eval result next to est-traj.")
     args = p.parse_args()
 
     seq_dir = Path(args.scene_dir) / args.seq
+
+    # Cache: if a previous eval has the same key args, just print it back.
+    cache_path = Path(args.est_traj).parent / args.cache_name
+    cache_key = {
+        "max_dist": args.max_dist,
+        "voxel": args.voxel,
+        "subsample": args.subsample,
+        "no_icp": bool(args.no_icp),
+        "all_frames_gt": bool(args.all_frames_gt),
+    }
+    if cache_path.exists() and not args.force:
+        import json
+        with open(cache_path) as f:
+            cached = json.load(f)
+        # If args match, print cached numbers and skip ICP.
+        if cached.get("_args") == cache_key:
+            m = cached["metrics"]
+            print(f"[cached] {cache_path}")
+            print(f"      ATE              : {m['ate']:.4f} m")
+            print(f"      Accuracy   RMSE  : {m['accuracy_rmse']:.4f} m   "
+                  f"(mean = {m['accuracy_mean']:.4f})")
+            print(f"      Completion RMSE  : {m['completion_rmse']:.4f} m   "
+                  f"(mean = {m['completion_mean']:.4f})")
+            print(f"      Chamfer    RMSE  : {m['chamfer_rmse']:.4f} m   "
+                  f"(mean = {m['chamfer_mean']:.4f})")
+            if "fps" in cached:
+                print(f"      FPS              : {cached['fps']:.2f}  "
+                      f"(frames={cached.get('frames','?')}, "
+                      f"kf={cached.get('keyframes','?')}, "
+                      f"time={cached.get('total_time_s', 0):.1f}s)")
+            return
+        else:
+            print(f"[cache mismatch — recomputing]  cached args: "
+                  f"{cached.get('_args')}, requested: {cache_key}")
 
     print(f"[1/5] Loading est pcd       : {args.est_ply}")
     est_pts = load_ply_xyz(args.est_ply)
@@ -238,14 +276,48 @@ def main():
     print(f"      Chamfer    RMSE  : {m['chamfer_rmse']:.4f} m   (mean = {m['chamfer_mean']:.4f})")
 
     # SLAM runtime stats (if saved by main.py)
+    fps_stats = None
     stats_path = Path(args.est_traj).parent / (Path(args.est_traj).stem + "_stats.json")
     if stats_path.exists():
-        import json
+        import json as _json
         with open(stats_path) as f:
-            s = json.load(f)
-        print(f"      FPS              : {s['fps']:.2f}  "
-              f"(frames={s['frames']}, kf={s['keyframes']}, "
-              f"time={s['total_time_s']:.1f}s)")
+            fps_stats = _json.load(f)
+        print(f"      FPS              : {fps_stats['fps']:.2f}  "
+              f"(frames={fps_stats['frames']}, kf={fps_stats['keyframes']}, "
+              f"time={fps_stats['total_time_s']:.1f}s)")
+
+    # Cache the result for fast re-display next time.
+    import json as _json
+    cached_out = {
+        "_args": cache_key,
+        "metrics": {
+            "ate": float(ate),
+            "accuracy_rmse": float(m["accuracy_rmse"]),
+            "accuracy_mean": float(m["accuracy_mean"]),
+            "completion_rmse": float(m["completion_rmse"]),
+            "completion_mean": float(m["completion_mean"]),
+            "chamfer_rmse": float(m["chamfer_rmse"]),
+            "chamfer_mean": float(m["chamfer_mean"]),
+        },
+        "sim3": {"scale": float(s), "t_norm": float(np.linalg.norm(t))},
+        "n_points_est": int(len(est_pcd.points)),
+        "n_points_gt": int(len(gt_pcd.points)),
+    }
+    if not args.no_icp:
+        cached_out["icp"] = {
+            "inlier_rmse": float(inlier_rmse),
+            "fitness": float(fitness),
+        }
+    if fps_stats is not None:
+        cached_out.update({
+            "fps": float(fps_stats["fps"]),
+            "frames": int(fps_stats["frames"]),
+            "keyframes": int(fps_stats["keyframes"]),
+            "total_time_s": float(fps_stats["total_time_s"]),
+        })
+    with open(cache_path, "w") as f:
+        _json.dump(cached_out, f, indent=2)
+    print(f"      cached → {cache_path}")
 
 
 if __name__ == "__main__":
