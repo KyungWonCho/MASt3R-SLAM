@@ -1,66 +1,55 @@
-# MASt3R-SLAM Diag — Key Findings
+# MASt3R-SLAM Diag — 핵심 관찰 정리
 
-Research notes from instrumenting `mast3r_slam/diag.py` and running on 7-Scenes (calib + no_calib).
-Companion to `scripts/analyze_diag.py` output at `logs/diag/plots/summary.md`.
-Section references below (`§N`) point to that summary.
+`mast3r_slam/diag.py`를 새로 추가해서 7-Scenes (calib + no_calib) 데이터를 수집하고, `scripts/analyze_diag.py`로 분석한 결과 요약. 자세한 표는 `logs/diag/plots/summary.md`에 있고, 여기 본문의 `§N` 표시는 그쪽 섹션 번호.
 
 ---
 
-## Setup
+## 셋업
 
-- **What we record**: per-pair per-pixel `(err, conf, z_gt, valid_match)` for two call sites —
-  tracking (asymmetric, frame ↔ current keyframe, every frame) and loop closure (symmetric, kf_i ↔ kf_j, per edge).
-- **Ground truth**: 7-Scenes depth backprojected with GT poses, expressed in the predicting camera's frame.
-- **Scenes covered (calib + no_calib for chess, calib only for the rest)**:
-  chess, fire, heads, office, pumpkin, redkitchen, stairs.
-- **Aggregate scale**: 3243 tracking pairs (552M valid pixels), 380 loop pairs (63M valid pixels) for calib.
+- **무엇을 기록하는가**: 두 군데 호출 사이트에서 per-pair per-pixel `(err, conf, z_gt, valid_match)` 를 GT 대비로 저장.
+  - **tracking** — asymmetric, frame ↔ 현재 keyframe, 매 frame
+  - **loop closure** — symmetric, kf_i ↔ kf_j, edge별
+- **Ground truth**: 7-Scenes의 depth를 GT pose로 backproject해서 predicting camera 좌표계에 표현
+- **돌린 scene**: chess는 calib + no_calib, 나머지(fire, heads, office, pumpkin, redkitchen, stairs)는 calib만
+- **전체 규모**: tracking 3243 pair (552M valid pixel), loop 380 pair (63M valid pixel)
 
 ---
 
-## Finding 1 — MASt3R confidence calibration is real but weak, and the current code's implicit interpretation is wrong
+## 관찰 1 — MASt3R confidence는 약하게 calibrated, 현재 코드의 암묵 해석은 어긋남
 
-**Empirically**: σ ≈ a · c^p with cross-scene aggregate fit
-`σ ≈ 0.708 · c^(-0.372)` for tracking (§2). Range across scenes: p ∈ [-0.23, -0.53] — never zero, but never -1.
+**측정값**: σ ≈ a · c^p, 모든 scene 합쳐서 fit하면
+`σ ≈ 0.708 · c^(-0.372)` (tracking, §2). scene별로는 p ∈ [-0.23, -0.53] 범위. 절대 0은 아니지만, 절대 -1도 아님.
 
-**What the current code assumes**: `frame.py:74-77` uses
+**현재 코드의 암묵 가정**: `frame.py:74-77`의 `weighted_pointmap`은
 
 ```python
 self.X_canon = ((self.C * self.X_canon) + (C * X)) / (self.C + C)
 self.C       = self.C + C
 ```
 
-A standard weighted average with weight = raw `c` implicitly assumes `σ² ∝ 1/c`, i.e. `σ ∝ c^(-0.5)`.
-**Measured** is `σ ∝ c^(-0.37)`. The code therefore over-weights high-confidence observations
-by a factor of `c^0.13` per update.
+weight를 raw `c`로 쓴다는 건 암묵적으로 **`σ² ∝ 1/c`, 즉 `σ ∝ c^(-0.5)` 가정**. 측정은 `σ ∝ c^(-0.37)`. 코드가 high-conf 관측을 매 업데이트마다 `c^0.13` 배 만큼 과신한다는 뜻.
 
-**What the calibrated weight should be**: the optimal inverse-variance weight is
-`w = 1/σ² ∝ c^(-2p) = c^0.74`.
+**Calibrated optimal weight**: inverse-variance weight `w = 1/σ² ∝ c^(-2p) = c^0.74`.
 
-| Assumption | σ vs c | Implied weight |
+| 가정 | σ vs c | 의미상 weight |
 |---|---|---|
-| Current (`weighted_pointmap`) | σ ∝ c^-0.5 | w = c |
-| MASt3R loss intent (1/|err|) | σ ∝ c^-1.0 | w = c² |
-| **Empirical fit** | **σ ∝ c^-0.37** | **w = c^0.74** |
+| 현재 코드 (`weighted_pointmap`) | σ ∝ c^-0.5 | w = c |
+| MASt3R loss 의도 (1/\|err\|) | σ ∝ c^-1.0 | w = c² |
+| **실측 fit** | **σ ∝ c^-0.37** | **w = c^0.74** |
 
-Loop calibration is much weaker: `σ ≈ 1.41 · c^(-0.186)` (§2). Confidence-based weighting in loop
-factors is correspondingly less informative.
+Loop는 calibration이 훨씬 약함: `σ ≈ 1.41 · c^(-0.186)` (§2). loop factor에서 confidence 기반 weight는 그만큼 정보량이 적음.
 
-**Per-scene consistency** (§1): all 7 scenes give p in a tight range, so this isn't a scene fluke.
-Stairs is an outlier in *conf level* (mean conf 2.8 vs 7–12 elsewhere) but its slope p = -0.53 is
-still within the band.
+**Scene별 일관성** (§1): 7 scene 모두 p 값이 좁은 범위에 들어와서 scene-fluke 아님. stairs는 *conf 절대값* 자체가 낮음 (mean 2.8, 다른 scene은 7~12) — 텍스처 빈약한 계단이라 MASt3R 자신감 자체가 떨어지는 case지만, slope p = -0.53은 여전히 비슷한 밴드.
 
 ---
 
-## Finding 2 — Fusion freezes; ~30–60% of keyframes are "early-wrong"
+## 관찰 2 — Fusion은 freeze됨, 30~60% 의 keyframe이 "early-wrong"
 
-**The mechanism**: `self.C += C` grows unbounded. After ~10–20 tracking pairs (typical conf ≈ 8),
-the accumulated `C` reaches ~100–300. The Kalman gain for the next observation,
-`c_new / (C_acc + c_new)`, then drops below 5%. The keyframe is effectively locked on the
-average of its early predictions.
+**메커니즘**: `self.C += C` 가 cap 없이 자라남. tracking pair ~10~20개 누적되면 (typical conf ≈ 8) `C_acc ≈ 100~300`에 도달. 다음 관측의 Kalman gain은 `c_new / (C_acc + c_new) < 5%`. 사실상 freeze.
 
-**How often**:
+**얼마나 자주 일어나나**:
 
-| scene | n_kf | updates_mean | updates_max | early-wrong (slope < -0.05) | never reached C=100 |
+| scene | n_kf | updates_mean | updates_max | early-wrong (slope < -0.05) | C=100 도달 못한 KF |
 |---|---:|---:|---:|---:|---:|
 | chess      | 11 | 45 | 91 | **6/11** | 0 |
 | stairs     |  8 | 31 | 46 | **5/8**  | 6 |
@@ -70,39 +59,34 @@ average of its early predictions.
 | pumpkin    | 13 | 38 | 68 | 3/13 | 1 |
 | heads      | 20 | 25 | 86 | 1/20 | 10 |
 
-"early-wrong" = mean err of the last n/4 pairs is at least 0.05 m lower than the mean err of the
-first n/4 pairs. **30–60% of keyframes in textured scenes** show this pattern.
+"early-wrong"의 정의: 마지막 n/4 pair의 err 평균이 처음 n/4 pair의 err 평균보다 0.05 m 이상 *작은* 경우. **텍스처 풍부한 scene들에서 30~60% 의 keyframe**이 이 패턴.
 
-**Top examples** (§12):
-- `chess kf=0`: err_first 0.659 → err_last 0.236 (≈3× improvement available if not frozen)
-- `fire kf=0`: err 0.288 → 0.119, with conf_mean = **16.76** — i.e. very high conf, but early was wrong
-- `pumpkin kf=426`: err 0.302 → 0.183, conf_mean 2.94
+**Top 예시** (§12):
+- `chess kf=0`: err_first 0.659 → err_last 0.236 (freeze만 안 됐으면 ~3배 개선 가능)
+- `fire kf=0`: 0.288 → 0.119, conf_mean **16.76** — conf가 매우 높은데도 초반이 틀림
+- `pumpkin kf=426`: 0.302 → 0.183, conf_mean 2.94
 
-The **fire kf=0** case is the strongest evidence that conf alone cannot detect early-wrong: the
-confidence is high *and* stable across updates, but the actual error halves over the keyframe's
-lifetime. Cap+calibration improves the rate at which dilution happens, but does not detect this
-disagreement.
+**`fire kf=0` 사례가 가장 결정적인 증거**예요. confidence가 충분히 높고 시간적으로 안정적인데 실제 err는 절반으로 줄어듦. 즉 **conf만 봐서는 "초반 틀림"을 절대 감지 못함**. Cap+calibration은 dilute 속도만 빠르게 하지, 충돌을 감지하지는 못함.
 
-**Cap sweet spot** (§11): fraction of updates that would have been "frozen" (`Σc > cap` before
-adding) under each cap candidate:
+**Cap sweet spot** (§11): 각 cap 후보에서 "이미 frozen 상태였을" update 비율:
 
-| cap | fraction frozen |
+| cap | frozen 비율 |
 |---:|---:|
-| 100  | **53.3 %** (too tight) |
-| **200** | (≈ midpoint, recommended) |
+| 100  | **53.3 %** (너무 좁음) |
+| **200** | (중간, 권장) |
 | 300  | 16.9 % |
-| 1000 | 0.1 % (lax, equivalent to "no cap" in practice) |
+| 1000 | 0.1 % (사실상 cap 없음과 동치) |
 
 ---
 
-## Finding 3 — Loop edges: most are not real loops, but real ones are gold
+## 관찰 3 — Loop edge: 대부분 진짜 loop가 아님, 진짜인 것은 정보 가치 큼
 
-**What "loop" pairs look like** (§13, §6, §7):
-- 61 % of loop pairs have view_angle < 2°
-- 39 % have baseline < 1 cm
-- These are **consecutive-keyframe edges**, not retrieval-discovered loop closures.
+**Loop pair의 실제 구성** (§13, §6, §7):
+- 61% 가 view_angle < 2°
+- 39% 가 baseline < 1 cm
+- 즉 **retrieval로 찾은 진짜 loop closure가 아니라 인접 keyframe edge** (consecutive)
 
-**Error vs geometry**:
+**Geometry vs err**:
 
 | view_angle bin | err_median | n_pairs |
 |---|---:|---:|
@@ -111,57 +95,37 @@ adding) under each cap candidate:
 | 5–10°  | 0.589 |  42 |
 | 10–20° | **0.426** | 6 |
 
-Real loops (`heads`, view_max = 13°) have err_rmse 0.76 m vs tracking 0.48 m — only 1.6× worse.
-Compare to chess loop (view_max = 1°, all consecutive): err_rmse 1.62 m, 3.4× tracking.
+진짜 loop가 있는 `heads` (view_max = 13°): err_rmse 0.76 m vs tracking 0.48 m — **1.6배 차이**. 반면 chess loop (view_max = 1°, 전부 consecutive): err_rmse 1.62 m, tracking 대비 **3.4배**.
 
-**Symmetric vs asymmetric decoder**: tracking uses `mast3r_match_asymmetric`,
-loops use `mast3r_match_symmetric`. Loop err is 2–4× tracking err even for matched real loops
-(heads 1.6×, office 3.6×). It is currently unclear whether this is intrinsic to the symmetric
-decode pass or a consequence of the harder pair geometry. **Worth a targeted ablation**: decode
-the same pair both ways and compare.
+**Symmetric vs asymmetric decoder**: tracking은 `mast3r_match_asymmetric`, loop는 `mast3r_match_symmetric`. 실제 loop이 있어 베이스라인이 깔린 heads도 tracking 대비 1.6배 — 일반화하면 loop err가 tracking err보다 2~4배 큼. 이게 symmetric decode 자체의 노이즈인지, pair geometry가 어려운 것 때문인지 *지금 데이터로는 결론 안 남*. **같은 pair를 두 mode로 동시에 decode해서 비교하는 ablation이 필요**.
 
-**Unused information**: `global_opt.py` calls `mast3r_match_symmetric(...)` which decodes
-`Xji, Xij` (pointmaps in each other's frame). Only `Qij` (joint conf) is currently kept as the
-factor weight. **The decoded pointmaps themselves are discarded.** For loop edges with
-view_angle > 5°, these are independent observations of keyframe `i` from a very different
-viewpoint — i.e., precisely the kind of decorrelated late observation that would mitigate
-early-wrong if fused back into `keyframe_i.X_canon`.
+**버려지고 있는 정보**: `global_opt.py`의 `mast3r_match_symmetric` 호출은 `Xji, Xij` (서로의 좌표계에서의 pointmap)도 decode함. 하지만 코드는 `Qij` (joint conf)만 factor weight로 쓰고 **pointmap 자체는 폐기**. view_angle > 5° 의 실제 loop edge에 대해 이 폐기된 pointmap은 **keyframe i를 *전혀 다른 시점*에서 본 독립 관측**. 즉 temporal 이웃에 갇힌 linear monotone fusion의 약점을 메워줄 수 있는 가장 decorrelated한 정보.
 
 ---
 
-## Finding 4 — Tracking is more robust to view angle than expected
+## 관찰 4 — Tracking은 view angle에 의외로 robust
 
-**Tracking view_angle distribution** (§13): median **10.84°**, p90 28.8°, max 63.2°. Not small.
-This is because the keyframe-selection threshold (`match_frac_thresh = 0.333`) is lax enough that
-a single keyframe is retained across substantial camera motion — `frame_diff` up to 182 (≈12 s
-of motion at the dataset's frame rate).
+**Tracking view_angle 분포** (§13): median **10.84°**, p90 28.8°, max 63.2°. 작지 않음.
+이유: keyframe 선정 임계치 `match_frac_thresh = 0.333` 이 느슨해서 카메라가 꽤 움직여도 같은 keyframe을 유지함 — `frame_diff_max = 182` (subsample=2 적용 후), 30fps라면 ~12초 분량의 운동.
 
-**Tracking err vs view_angle** (§3): essentially flat. err_median is 0.20 m at 0–2° and
-0.23 m at 20–30°. **MASt3R is empirically robust to view angle up to ~60° on textured indoor
-scenes**, contrary to the intuition that high view angle would dominate the error budget.
+**Tracking err vs view_angle** (§3): 거의 평평. 0~2°에서 err_median 0.20 m, 20~30°에서 0.23 m. **MASt3R는 60°까지도 텍스처 풍부한 실내 scene에서는 깨지지 않음**. "high view angle = 노이즈 dominant" 라는 직관이 *측정으로 기각됨*.
 
-Implication for fusion design: gating by view_angle is *not* warranted in tracking. Conf
-calibration captures whatever signal view_angle would have contributed.
+Fusion 설계에 대한 함의: tracking에서 view_angle gate는 **불필요**. conf calibration이 view_angle이 줄 만한 추가 signal을 이미 흡수.
 
-**Tracking err vs baseline** (§4): mildly decreasing — 0.27 m at <1 cm baseline → 0.17 m at >1 m.
-Larger motion gives slightly better predictions (more parallax, but MASt3R already handles
-single-view monocular cues well).
+**Tracking err vs baseline** (§4): 약하게 감소 — baseline < 1 cm 에서 0.27 m, > 1 m 에서 0.17 m. 큰 motion이 *조금* 더 좋은 예측 (parallax 효과), but monocular cue로 이미 잘 추정하니까 큰 폭은 아님.
 
 ---
 
-## Finding 5 — Calib and no_calib are indistinguishable at the diag level
+## 관찰 5 — Diag 차원에서 Calib과 No_calib은 구분 불가
 
-Confirmed on `chess` (both modes run): tracking err_rmse 0.479 (calib) vs 0.493 (no_calib),
-σ fit parameters within ~2 %. This is *expected* because diag measures the raw MASt3R decoder
-output, which is intrinsic-independent. Calib/no_calib differences live downstream in the
-pose-estimation loop. Implication: we skipped `no_calib` runs for the remaining six scenes
-without information loss.
+`chess` 양 mode로 검증: tracking err_rmse 0.479 (calib) vs 0.493 (no_calib), σ fit 파라미터 ~2% 차이.
+이건 *원리적으로 예상*되는 결과 — diag는 raw MASt3R decoder 출력을 측정. 그 출력은 intrinsic 사용 여부와 무관. Calib/no_calib 차이는 *downstream의 pose-estimation loop* 에서 발생. 그래서 나머지 6 scene에서 no_calib을 skip한 게 정보 손실 없음.
 
 ---
 
-## Synthesis — proposed direction
+## 종합 — 제안 방향
 
-### Phase 1 — Cap + Calibration (`frame.py:74-77`, ~4 lines)
+### Phase 1 — Cap + Calibration (`frame.py:74-77`, 변경 ~4줄)
 
 ```python
 elif filtering_mode == "weighted_pointmap":
@@ -171,51 +135,31 @@ elif filtering_mode == "weighted_pointmap":
     self.N += 1
 ```
 
-Validated by §11 (cap=200 → freeze rate effectively 0) and the fusion simulation
-(`logs/diag/plots/fusion_sim.csv`, §13 sim table) against the current `w=c` scheme.
+§11 (cap=200 이면 freeze 거의 0)과 §13의 fusion 시뮬레이션으로 검증.
 
-### Phase 2 — Innovation handling (the user's real goal: "fast correction")
+### Phase 2 — Innovation 처리 (user의 진짜 목표: "빠른 correction")
 
-Cap+calibration prevents freeze but does **not** detect or correct early-wrong cases. To
-recover the gap to oracle_best in early-wrong keyframes, the system needs to *inflate*
-σ² (or `self.C`) when a new observation disagrees with the canonical estimate.
+Cap+calibration는 *freeze 방지*만 하지, early-wrong을 *감지하거나 빠르게 고치지* 않음. early-wrong 시 oracle_best까지의 갭을 메우려면 **disagreement 감지 시 σ² (또는 self.C) 을 inflate** 해서 다음 관측의 영향력을 즉시 회복시켜야 함.
 
-Two viable forms:
-- **Innovation-inflated KF-lite**: replace `self.C` with `self.sigma2` (same memory). Compute
-  per-pixel Mahalanobis-like ratio at each update; inflate σ² when it exceeds a threshold.
-- **Adaptive forgetting**: `self.C = λ * self.C + w_new`, with λ adapting down when residual
-  is large.
+두 가지 형태가 가능:
+- **Innovation-inflated KF-lite**: `self.C` → `self.sigma2` 로 의미만 바꿈 (메모리 동일). 매 업데이트에서 per-pixel Mahalanobis-like ratio 계산, 임계치 초과 시 σ²을 곱해서 부풀림.
+- **Adaptive forgetting**: `self.C = λ * self.C + w_new`, residual 크면 λ를 줄임.
 
-The first is more principled and naturally extends the calibrated noise model. The second is
-simpler and may be enough.
+전자가 더 원칙적이고 calibrated noise model의 자연스러운 확장. 후자가 더 단순. 둘 다 시도 가치.
 
-This phase is what addresses the user's intent — the per-pixel uncertainty isn't valuable *as
-uncertainty*, it's valuable as the substrate for innovation gating.
+**여기가 user 의도("초기가 틀리면 빨리 고치라")의 핵심.** Per-pixel uncertainty가 가치 있는 이유는 그 자체가 uncertainty라서가 아니라, innovation gating을 가능하게 하는 기반이라서.
 
-### Phase 3 — Loop pointmap reuse (orthogonal to Phases 1 & 2)
+### Phase 3 — Loop pointmap 재활용 (Phase 1, 2와 직교)
 
-For loop edges with `view_angle > ~5°` (real parallax), feed `Xji`, `Xij` back into the
-respective keyframes' `update_pointmap`. The decode cost is already paid for the matching
-step, so this is essentially free additional observations from a maximally decorrelated
-viewpoint. Most directly addresses early-wrong by adding observations *outside* the temporal
-neighbourhood that the linear monotone fusion was stuck on.
+view_angle > ~5° 의 real loop edge에서 `Xji`, `Xij`를 각각 keyframe_j, keyframe_i 의 `update_pointmap` 에 재투입. Decode 비용은 이미 matching 단계에서 지불됨 → 사실상 *공짜로* 최대로 decorrelated된 시점의 관측 추가. early-wrong에 대한 *간접* 처방: linear monotone fusion이 갇혀 있던 temporal neighborhood *바깥의* 정보를 keyframe에 주입.
 
 ---
 
-## Open questions / things still worth checking
+## 아직 미해결 / 추가로 확인할 가치 있는 것
 
-1. **Symmetric vs asymmetric decoder for the same pair** — requires a diag.py extension that
-   decodes a sample of loop pairs both ways. Would settle whether loop's 2–4× err is intrinsic
-   to symmetric mode or a geometry artefact.
-2. **Spatial structure of err** — is per-pixel err concentrated near image boundaries or depth
-   discontinuities? If so, conf as a single per-pixel scalar can't capture it; learned spatial
-   priors would be a separate research angle.
-3. **Match validity correlation** — `valid_match` is stored but unused in the current
-   analysis. Are matched pixels systematically more accurate? If yes, fusion should weight by
-   `c · valid_match`, not `c`.
-4. **Relative (err / z_gt)** — does the σ ≈ c^-0.37 calibration hold when error is normalised
-   by GT depth? Could explain part of the per-scene a-coefficient variation.
-5. **Match frac as a loop gate** — `min_match_frac = 0.1` is currently the only loop gate.
-   Combined gates on (match_frac, view_angle, baseline) might do better than any one alone.
-6. **Train-vs-test sequence effect** — were the 7-Scenes runs on sequences MASt3R has trained
-   on? If so, conf may be biased high there.
+1. **Symmetric vs asymmetric decoder를 같은 pair에 적용 비교** — diag.py 확장 필요. loop의 2~4× err가 symmetric mode 자체의 한계인지 geometry 탓인지 결론 가능. paper-level finding 후보.
+2. **err의 spatial 구조** — per-pixel err가 image 경계나 depth 불연속에 몰리는지? 그렇다면 scalar conf 하나로는 못 잡고, learned spatial prior 등 별도 연구 방향.
+3. **valid_match correlation** — `valid_match` 저장돼 있지만 아직 분석에 미사용. matched pixel이 unmatched보다 systematic하게 더 정확하다면, fusion weight는 `c · valid_match` 가 옳음.
+4. **err를 z_gt로 정규화한 relative err** — σ ≈ c^-0.37 calibration이 깊이로 정규화해도 유지되나? scene별 a 계수 차이의 일부가 이걸로 설명될 수 있음.
+5. **Loop gate criterion** — 현재 `min_match_frac = 0.1` 만 사용. (match_frac, view_angle, baseline) 결합 gate가 더 나을 수 있음.
+6. **Train/test sequence 영향** — 7-Scenes의 어떤 sequence가 MASt3R 학습에 포함됐는지에 따라 conf가 편향될 수 있음.
