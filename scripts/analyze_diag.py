@@ -14,6 +14,7 @@ Outputs (in <out_dir>):
 import argparse
 import csv
 import math
+from collections import defaultdict
 from pathlib import Path
 
 import matplotlib
@@ -21,6 +22,15 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+
+
+# Calibrated noise-model assumption (from cross-scene σ(c) fit, see summary 2)
+# σ ≈ a · c^p_meas with p_meas ≈ -0.3.
+# If we treat σ² as the precision-1, the optimal inverse-variance weight is
+# w ∝ 1/σ² = c^(-2 p_meas) ≈ c^0.6.  We use this in the simulated reweighting.
+P_MEAS = -0.3
+W_EXP = -2.0 * P_MEAS   # ≈ 0.6
+C_CAP_CANDIDATES = (100.0, 300.0, 1000.0)  # accumulated-C caps to simulate
 
 
 # ---------------------------------------------------------------------- #
@@ -64,6 +74,8 @@ def per_pair_rows(d, scene, mode, role):
             "role": role,
             "pair_idx": i,
             "kind": str(d["kind"][i]) if d["kind"].size else role,
+            "frame_id_pred": int(d["frame_id_pred"][i]),
+            "frame_id_target": int(d["frame_id_target"][i]),
             "baseline": float(d["baseline"][i]),
             "view_angle_deg": float(d["view_angle_deg"][i]),
             "frame_diff": int(d["frame_diff"][i]),
@@ -75,6 +87,142 @@ def per_pair_rows(d, scene, mode, role):
             "conf_median": conf_med,
         })
     return rows
+
+
+# ---------------------------------------------------------------------- #
+# Per-keyframe (fusion-target) analyses
+# ---------------------------------------------------------------------- #
+
+def per_keyframe_table(per_pair, role="tracking"):
+    """Group tracking pairs by (scene, frame_id_target).
+       Time-order them by frame_id_pred and compute fusion-relevant stats:
+       - n_updates                  number of pairs that hit this keyframe
+       - cum_C                      cumulative sum of conf_median (proxy for self.C)
+       - k_freeze_100/300/1000      pair index where cum_C first crosses each cap
+       - err_first, err_last        median-err of first / last pair
+       - err_trend_slope            sign of (err_late - err_early) / n
+                                    > 0 → late worse  (early wins)
+                                    < 0 → late better (early-wrong; current code freezes late)
+       - err_disagreement_std       std of per-pair err_median across this kf
+       - effective_N_uncapped       N (geometric mean of relative weight = 1/N effectively)
+       - effective_N_w_exp          same but with w = c^W_EXP instead of c
+    """
+    by_kf = defaultdict(list)
+    for r in per_pair:
+        if r["role"] != role:
+            continue
+        by_kf[(r["scene"], r["frame_id_target"])].append(r)
+
+    out = []
+    for (scene, kf), pairs in by_kf.items():
+        pairs.sort(key=lambda r: r["frame_id_pred"])
+        confs = np.array([p["conf_median"] for p in pairs], dtype=np.float64)
+        errs = np.array([p["err_median"] for p in pairs], dtype=np.float64)
+        bls = np.array([p["baseline"] for p in pairs], dtype=np.float64)
+        vas = np.array([p["view_angle_deg"] for p in pairs], dtype=np.float64)
+
+        n = len(pairs)
+        cum_C = np.cumsum(confs)
+        cum_W = np.cumsum(np.maximum(confs, 1e-6) ** W_EXP)
+
+        k_freeze = {}
+        for cap in C_CAP_CANDIDATES:
+            idx = int(np.searchsorted(cum_C, cap))
+            k_freeze[cap] = idx if idx < n else -1  # -1 = never reached
+
+        # Trend: simple sign of (mean of last quartile) - (mean of first quartile)
+        if n >= 4 and np.all(np.isfinite(errs)):
+            q = max(1, n // 4)
+            slope = float(errs[-q:].mean() - errs[:q].mean())
+        else:
+            slope = float("nan")
+
+        out.append({
+            "scene": scene,
+            "frame_id_target": int(kf),
+            "n_updates": n,
+            "conf_mean_obs": float(np.nanmean(confs)),
+            "conf_max_obs": float(np.nanmax(confs)),
+            "cum_C_final": float(cum_C[-1]),
+            "cum_W_final": float(cum_W[-1]),
+            "k_freeze_100": k_freeze[100.0],
+            "k_freeze_300": k_freeze[300.0],
+            "k_freeze_1000": k_freeze[1000.0],
+            "err_first": float(errs[0]) if n > 0 else float("nan"),
+            "err_last": float(errs[-1]) if n > 0 else float("nan"),
+            "err_min": float(np.nanmin(errs)) if n > 0 else float("nan"),
+            "err_max": float(np.nanmax(errs)) if n > 0 else float("nan"),
+            "err_mean": float(np.nanmean(errs)) if n > 0 else float("nan"),
+            "err_std": float(np.nanstd(errs)) if n > 1 else 0.0,
+            "err_trend_late_minus_early": slope,
+            "baseline_max": float(np.nanmax(bls)) if n > 0 else float("nan"),
+            "view_angle_max": float(np.nanmax(vas)) if n > 0 else float("nan"),
+        })
+    return out
+
+
+def plot_kf_err_trajectories(per_pair, out_path, role="tracking", n_plot=12):
+    """Per-keyframe err vs pair index. Picks the n_plot keyframes with most pairs."""
+    by_kf = defaultdict(list)
+    for r in per_pair:
+        if r["role"] != role:
+            continue
+        by_kf[(r["scene"], r["frame_id_target"])].append(r)
+    if not by_kf:
+        return
+    items = sorted(by_kf.items(), key=lambda kv: -len(kv[1]))[:n_plot]
+    ncols = 3
+    nrows = (len(items) + ncols - 1) // ncols
+    fig, axes = plt.subplots(nrows, ncols, figsize=(13, 3.2 * nrows),
+                             squeeze=False)
+    for ax, ((scene, kf), pairs) in zip(axes.flat, items):
+        pairs.sort(key=lambda r: r["frame_id_pred"])
+        errs = np.array([p["err_median"] for p in pairs])
+        confs = np.array([p["conf_median"] for p in pairs])
+        x = np.arange(len(pairs))
+        ax.plot(x, errs, "o-", color="tab:blue", label="err_median (m)")
+        ax2 = ax.twinx()
+        ax2.plot(x, confs, "s--", color="tab:orange", alpha=0.6, label="conf_median")
+        ax.set_title(f"{scene} kf={kf}  N={len(pairs)}", fontsize=9)
+        ax.set_xlabel("pair index (time-ordered)")
+        ax.set_ylabel("err", color="tab:blue")
+        ax2.set_ylabel("conf", color="tab:orange")
+        ax.grid(True, alpha=0.3)
+    for ax in axes.flat[len(items):]:
+        ax.axis("off")
+    fig.suptitle(f"Per-keyframe err & conf trajectories ({role})")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=110)
+    plt.close(fig)
+
+
+def plot_sigma_with_refs(c_mid, rmse, count, a_meas, p_meas, out_path, title):
+    """σ(c) on log-log with reference lines for c^-0.5 (current Kalman assumption),
+       c^-1 (Gaussian std), and c^p_meas (the fit)."""
+    fig, ax = plt.subplots(1, 1, figsize=(7.5, 5))
+    ax.loglog(c_mid, rmse, "o-", color="tab:blue",
+              label=fr"measured  $\sigma$ (RMSE per bin)")
+    # Reference lines anchored at the geometric-mean c
+    finite = np.isfinite(rmse) & np.isfinite(c_mid) & (c_mid > 0)
+    if finite.any():
+        c_anchor = np.exp(np.mean(np.log(c_mid[finite])))
+        sig_anchor = np.exp(np.mean(np.log(rmse[finite])))
+        c_grid = np.geomspace(c_mid[finite].min(), c_mid[finite].max(), 50)
+        for p_ref, label in [
+            (-0.5, "current Kalman:  w∝c  ⇒  σ∝c^-0.5"),
+            (-1.0, "Gaussian std:  conf=1/σ  ⇒  σ∝c^-1"),
+            (p_meas, f"fit:  σ∝c^{p_meas:.2f}"),
+        ]:
+            ref = sig_anchor * (c_grid / c_anchor) ** p_ref
+            ax.loglog(c_grid, ref, "--", alpha=0.6, label=label)
+    ax.set_xlabel("confidence c (log)")
+    ax.set_ylabel("σ  (m, log)")
+    ax.set_title(title)
+    ax.grid(True, which="both", alpha=0.3)
+    ax.legend(fontsize=8, loc="best")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=110)
+    plt.close(fig)
 
 
 # ---------------------------------------------------------------------- #
@@ -514,8 +662,172 @@ def main():
         rows,
         aligns=["---", "---:", "---:", "---:", "---:", "---:", "---:", "---:"]))
 
-    # 7f. View-angle distribution check
-    md.append("\n## 9. View angle distribution (sanity check — \"tracking view angles small?\")\n")
+    # ------------------------------------------------------------------ #
+    # NEW: fusion-focused analyses (cap+calibration evidence)
+    # ------------------------------------------------------------------ #
+
+    # 7f-pre. σ(c) with reference lines (Kalman c^-0.5, Gaussian c^-1, fit c^p)
+    if "tracking" in agg_sigma and hist_edges_ref is not None:
+        H = np.concatenate(hist_agg["tracking"], axis=0)
+        total = H.sum(axis=0)
+        c_mid, count, mean, rmse, std = calibration_from_hist(total, hist_edges_ref)
+        plot_sigma_with_refs(
+            c_mid, rmse, count,
+            agg_sigma["tracking"]["a"], agg_sigma["tracking"]["p"],
+            out_dir / "aggregate_tracking_sigma_with_refs.png",
+            "Aggregate tracking σ(c) — measured vs reference exponents",
+        )
+
+    # Per-keyframe table (tracking only; loop has very few pairs per kf)
+    kf_rows = per_keyframe_table(per_pair, role="tracking")
+    if kf_rows:
+        # CSV
+        kf_csv = out_dir / "per_keyframe.csv"
+        keys = list(kf_rows[0].keys())
+        with open(kf_csv, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=keys)
+            w.writeheader()
+            for r in kf_rows:
+                w.writerow(r)
+        plot_kf_err_trajectories(
+            per_pair, out_dir / "kf_err_trajectories.png", role="tracking", n_plot=12,
+        )
+
+    # 7g. Per-keyframe summary: how many updates each keyframe gets, freeze, trend
+    md.append("\n## 9. Per-keyframe fusion stats (tracking only)\n")
+    md.append("Each row = one keyframe (frame_id_target). `k_freeze_X` = pair index at which "
+              "accumulated `Σ c` first exceeds X (i.e., when gain from a new obs becomes < c/X). "
+              "`err_trend` = `mean(err of last n/4 pairs) - mean(first n/4)`. "
+              "**negative ⇒ late observations are BETTER than early ones** "
+              "→ \"early-wrong\" candidate where current code's freeze hurts.\n")
+
+    # Scene-level aggregated KF stats
+    by_scene = defaultdict(list)
+    for r in kf_rows:
+        by_scene[r["scene"]].append(r)
+    rows = []
+    for scene in sorted(by_scene.keys()):
+        rs = by_scene[scene]
+        n_kf = len(rs)
+        n_updates = np.array([r["n_updates"] for r in rs])
+        cum_C = np.array([r["cum_C_final"] for r in rs])
+        k100 = np.array([r["k_freeze_100"] for r in rs])
+        k300 = np.array([r["k_freeze_300"] for r in rs])
+        k1000 = np.array([r["k_freeze_1000"] for r in rs])
+        slopes = np.array([r["err_trend_late_minus_early"] for r in rs])
+        slopes = slopes[np.isfinite(slopes)]
+        # "early-wrong" candidates: late_err < early_err - small_margin
+        n_early_wrong = int((slopes < -0.05).sum())
+        # never-frozen at 100 = pair count is fewer than steps needed to reach 100
+        n_never100 = int((k100 == -1).sum())
+        rows.append([
+            scene,
+            n_kf,
+            f"{n_updates.mean():.1f}",
+            f"{int(np.median(n_updates))}",
+            int(n_updates.max()),
+            f"{cum_C.mean():.0f}",
+            f"{int(np.median(k100)) if (k100 != -1).any() else 'n/a'}",
+            f"{int(np.median(k300)) if (k300 != -1).any() else 'n/a'}",
+            f"{int(np.median(k1000)) if (k1000 != -1).any() else 'n/a'}",
+            f"{n_early_wrong}/{len(slopes)}" if len(slopes) else "0/0",
+            f"{n_never100}/{n_kf}",
+        ])
+    md.append(md_table(
+        ["scene", "n_kf", "updates_mean", "updates_med", "updates_max",
+         "cum_C_mean", "med_k_to_100", "med_k_to_300", "med_k_to_1000",
+         "early_wrong (slope<-0.05)", "never_hit_C=100"],
+        rows,
+        aligns=["---"] + ["---:"] * 10,
+    ))
+
+    # 7h. Effective N under current (w=c) vs calibrated (w=c^W_EXP)
+    md.append("\n## 10. Effective fusion weight: raw c  vs  c^{:.2f}  (calibrated)\n".format(W_EXP))
+    md.append("For each keyframe, compare accumulated weight under the current code "
+              "`Σ c` versus the calibrated weight `Σ c^{:.2f}`. The calibrated form "
+              "compresses the dynamic range and makes high-conf observations less dominant "
+              "(consistent with the measured σ∝c^{:.2f}).\n".format(W_EXP, P_MEAS))
+    rows = []
+    for scene in sorted(by_scene.keys()):
+        rs = by_scene[scene]
+        cum_C = np.array([r["cum_C_final"] for r in rs])
+        cum_W = np.array([r["cum_W_final"] for r in rs])
+        rows.append([
+            scene,
+            f"{cum_C.mean():.1f}",
+            f"{cum_W.mean():.1f}",
+            f"{(cum_C / np.maximum(cum_W, 1e-6)).mean():.2f}",
+        ])
+    md.append(md_table(
+        ["scene", "Σc (mean)", "Σc^p (mean)", "ratio Σc/Σc^p"],
+        rows,
+        aligns=["---"] + ["---:"] * 3,
+    ))
+
+    # 7i. Cap candidates — what fraction of updates are "wasted" past each cap
+    md.append("\n## 11. Cap candidates (tracking)\n")
+    md.append("For each cap, fraction of updates where current accumulated Σ c already "
+              "exceeds the cap (i.e., updates whose gain would have been < c/cap, "
+              "and that the cap would now *preserve* the influence of).\n")
+    # Build per-update Σc trajectory and count fraction above each cap
+    sums_by_scene = defaultdict(list)
+    for r in kf_rows:
+        # need to recompute trajectory per kf — use n_updates and cum_C_final & k_freeze_*
+        # simpler: count how many updates would exceed each cap globally
+        pass
+    # Instead: per-update test by re-walking per_pair grouped by kf
+    by_kf = defaultdict(list)
+    for r in per_pair:
+        if r["role"] != "tracking":
+            continue
+        by_kf[(r["scene"], r["frame_id_target"])].append(r)
+    cap_rows = []
+    for cap in C_CAP_CANDIDATES:
+        total_updates = 0
+        above_cap = 0
+        for key, pairs in by_kf.items():
+            pairs_sorted = sorted(pairs, key=lambda r: r["frame_id_pred"])
+            confs = np.array([p["conf_median"] for p in pairs_sorted])
+            cum = np.cumsum(confs)
+            # 'pre' Σc at each step (before adding the current obs)
+            pre = np.concatenate([[0.0], cum[:-1]])
+            total_updates += len(pre)
+            above_cap += int((pre > cap).sum())
+        frac = above_cap / max(total_updates, 1)
+        cap_rows.append([f"{cap:.0f}", total_updates, above_cap, f"{frac*100:.1f}%"])
+    md.append(md_table(
+        ["cap", "total_updates", "updates_with_Σc>cap_already",
+         "fraction_frozen"],
+        cap_rows,
+        aligns=["---:", "---:", "---:", "---:"],
+    ))
+
+    # 7j. Top "early-wrong" keyframes (negative err trend, decent N)
+    md.append("\n## 12. Top early-wrong keyframes (late obs better than early)\n")
+    md.append("Top 12 keyframes (across scenes) with the most negative err trend slope and "
+              "n_updates ≥ 5. Indicates cases where the current monotone accumulator "
+              "is locked on an early prediction that later observations would correct.\n")
+    cand = [r for r in kf_rows
+            if r["n_updates"] >= 5 and np.isfinite(r["err_trend_late_minus_early"])]
+    cand.sort(key=lambda r: r["err_trend_late_minus_early"])
+    rows = []
+    for r in cand[:12]:
+        rows.append([
+            r["scene"], r["frame_id_target"], r["n_updates"],
+            f"{r['err_first']:.3f}", f"{r['err_last']:.3f}",
+            f"{r['err_trend_late_minus_early']:.3f}",
+            f"{r['err_std']:.3f}",
+            f"{r['conf_mean_obs']:.2f}",
+        ])
+    md.append(md_table(
+        ["scene", "kf", "N", "err_first", "err_last", "slope",
+         "err_std", "conf_mean"],
+        rows,
+        aligns=["---", "---:", "---:", "---:", "---:", "---:", "---:", "---:"],
+    ))
+
+    # Existing 7f (renumbered 13)
+    md.append("\n## 13. View angle distribution (sanity check — \"tracking view angles small?\")\n")
     for role in ("tracking", "loop"):
         vs = [r["view_angle_deg"] for r in per_pair
               if r["role"] == role and np.isfinite(r["view_angle_deg"])]
