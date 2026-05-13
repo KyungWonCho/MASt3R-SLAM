@@ -154,15 +154,39 @@ Fusion 설계에 대한 함의: tracking에서 view_angle gate는 **불필요**.
 
 | Phase | 내용 | 상태 |
 |---|---|---|
-| 1+2 (통합) | `weighted_pointmap_calib` filtering mode: calibrated weight `c^0.74` + cap=200 + per-pixel innovation gate (relative residual > 0.3 ⇒ W ÷= 4) | ✅ 구현됨 (`mast3r_slam/frame.py`), branch `diag/7-scenes` |
+| 1+2 (통합) | `weighted_pointmap_calib` filtering mode: per-pixel scalar Kalman with calibrated obs-variance `σ²(c)=(a·c^p)²` + σ² floor + **Mahalanobis-gated variance inflation** | ✅ 구현됨 (`mast3r_slam/frame.py`), branch `diag/7-scenes` |
 | 3 | Loop edge에서 폐기되는 X_ji 재활용 | ⏳ 미구현 |
 | 4 | Loop closure geometric verification (per-pixel pointmap residual gate 또는 3D-3D RANSAC) | ⏳ 미구현 |
 
-**Phase 1+2 코드 디테일:**
-- `Frame` dataclass에 `W` (calibrated 누적 precision) 필드 추가, 기존 `C` 는 raw 누적으로 유지 (downstream conf threshold 호환)
-- 새 config 섹션 `tracking.fusion`: `w_exp`, `cap`, `innov_rel`, `innov_inflate` 4개 노브
-- `config/eval_calib_fusion.yaml`, `config/eval_no_calib_fusion.yaml` 생성 — `eval_7_scenes.sh --variant fusion` 로 사용
-- 기존 `weighted_pointmap` 그대로 두고 새 mode 추가 → A/B 비교 가능
+**Phase 1+2 코드 디테일 (proper per-pixel KF):**
+
+`Frame` dataclass에 `sigma2` (per-pixel scalar variance) 필드 추가, 기존 `C` 는 raw 누적으로 유지 (downstream conf threshold 호환).
+
+업데이트 식 (per pixel):
+```
+σ²_obs = (a · c^p)²                                # calibrated obs variance
+K       = σ²_canon / (σ²_canon + σ²_obs)           # Kalman gain
+X_canon ← X_canon + K · (X - X_canon)
+σ²_canon ← (1 - K) · σ²_canon
+σ²_canon ← max(σ²_canon, σ²_floor)                 # prevents freeze
+```
+
+Innovation gate (early-wrong fast correction):
+```
+mahala² = |X - X_canon|² / (σ²_canon + σ²_obs)     # ~ χ²(3) under null
+if mahala² > 9:                                    # χ²(3) 97 %ile
+    σ²_canon ←= 4                                  # less trust in prior
+```
+
+**왜 `mahala² > 9` ?** 3D residual + isotropic σ² 가정 하에서 `|innov|² / σ²_combined` 가 χ² with 3 dof 따름. 9는 χ²(3)의 97 %ile — "노이즈 모델이 맞다면 가장 surprising한 3% 관측" 에서 gate fire. 임의 휴리스틱이 아니라 **통계적으로 정당화되는** false positive rate 제어.
+
+**config 섹션 `tracking.fusion`** — 5개 노브:
+- `sigma_a = 0.708`, `sigma_p = -0.372` : §2 cross-scene fit
+- `sigma2_floor = 5e-3` : effective N ≈ σ²_obs / σ²_floor ≈ 20 정도
+- `mahala2_thresh = 9.0` : χ²(3) 97 %ile
+- `inflation = 4.0` : gate fire 시 σ² 배수
+
+**기존 `weighted_pointmap` 그대로** 두고 새 mode 추가 → A/B 비교 가능.
 
 **평가 중 (서버, 4-GPU 병렬):**
 - vanilla (`config/eval_calib.yaml`) vs fusion (`config/eval_calib_fusion.yaml`) on 7-Scenes 전 scene

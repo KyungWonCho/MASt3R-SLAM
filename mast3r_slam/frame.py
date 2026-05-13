@@ -24,10 +24,12 @@ class Frame:
     T_WC: lietorch.Sim3 = lietorch.Sim3.Identity(1)
     X_canon: Optional[torch.Tensor] = None
     C: Optional[torch.Tensor] = None
-    # Calibrated accumulated precision for filtering_mode=="weighted_pointmap_calib".
-    # Kept separate from C so downstream conf thresholds (which expect raw c) stay
-    # backwards compatible. W is per-pixel.
-    W: Optional[torch.Tensor] = None
+    # Per-pixel scalar variance estimate for filtering_mode=="weighted_pointmap_calib".
+    # Initialised from the calibrated obs variance on first call into that branch,
+    # then propagated via proper scalar Kalman updates (with Mahalanobis innovation
+    # gating). Kept separate from C so downstream conf thresholds (which expect raw
+    # c) stay backwards compatible. sigma2 shape == C shape (per pixel, scalar).
+    sigma2: Optional[torch.Tensor] = None
     feat: Optional[torch.Tensor] = None
     pos: Optional[torch.Tensor] = None
     N: int = 0
@@ -80,43 +82,65 @@ class Frame:
             self.C = self.C + C
             self.N += 1
         elif filtering_mode == "weighted_pointmap_calib":
-            # Calibrated weighted fusion with cap and innovation-based variance
-            # inflation. Derived from the 7-Scenes diag finding σ ∝ c^p with
-            # p ≈ -0.37 (cross-scene aggregate). Three knobs:
-            #   w_exp:        weight exponent (= -2 p_meas ≈ 0.74). raw c is wrong.
-            #   cap:          ceiling on accumulated precision W; without it,
-            #                 gain → 0 after ~10 updates and the keyframe
-            #                 freezes on its early predictions.
-            #   innov_rel:    if a new obs disagrees with X_canon by more than
-            #                 innov_rel × depth at a pixel, that pixel's W is
-            #                 divided by innov_inflate — the system "forgets"
-            #                 the prior locally so the new obs takes over fast.
-            #                 Set to <=0 to disable.
+            # Per-pixel scalar Kalman fusion with calibrated obs-variance model
+            # and Mahalanobis-gated variance inflation. Derived from the 7-Scenes
+            # diag finding σ ∝ a · c^p with cross-scene a ≈ 0.708, p ≈ -0.37.
+            #
+            #   σ²_obs(c) = (a · c^p)²        per-pixel obs variance (scalar)
+            #   K         = σ²_canon / (σ²_canon + σ²_obs)
+            #   X_canon  ← X_canon + K (X - X_canon)
+            #   σ²_canon ← (1 - K) σ²_canon
+            #
+            # Innovation gating uses chi²-distributed |innov|² / (3 σ²_combined)
+            # (isotropic scalar variance, 3D residual ⇒ chi² with 3 dof). When
+            # the test exceeds mahala2_thresh, σ²_canon is multiplied by
+            # `inflation` *before* the Kalman update, so the new obs immediately
+            # gets a larger gain — that's the "early-wrong fast correction"
+            # mechanism the cap-only design couldn't provide.
+            #
+            # Floor on σ²_canon prevents unbounded shrinkage (= freeze).
+            #
+            # Knobs (under config tracking.fusion):
+            #   sigma_a, sigma_p   calibrated noise model
+            #   sigma2_floor       lower bound on σ²_canon (≈ 1/cap in W-form)
+            #   mahala2_thresh     chi²(3) gate: 9 ≈ 97th percentile
+            #   inflation          multiplier on σ²_canon when gate fires
             fcfg = config["tracking"].get("fusion", {})
-            w_exp = fcfg.get("w_exp", 0.74)
-            cap = fcfg.get("cap", 200.0)
-            innov_rel = fcfg.get("innov_rel", 0.3)
-            innov_inflate = fcfg.get("innov_inflate", 4.0)
+            sigma_a = fcfg.get("sigma_a", 0.708)
+            sigma_p = fcfg.get("sigma_p", -0.372)
+            sigma2_floor = fcfg.get("sigma2_floor", 5e-3)
+            mahala2_thresh = fcfg.get("mahala2_thresh", 9.0)
+            inflation = fcfg.get("inflation", 4.0)
 
-            w_new = C.clamp(min=1e-6) ** w_exp
-            # First call into this branch: convert N==0 init (which stored raw C)
-            # to the calibrated accumulator.
-            if self.W is None:
-                self.W = (self.C.clamp(min=1e-6) ** w_exp).clamp(max=cap)
+            c_safe = C.clamp(min=1e-6)
+            sigma2_obs = (sigma_a * c_safe ** sigma_p) ** 2
 
-            # Innovation gating: per-pixel relative residual.
-            if innov_rel > 0:
-                residual = (X - self.X_canon).norm(dim=-1, keepdim=True)
-                depth_scale = self.X_canon.norm(dim=-1, keepdim=True).clamp(min=1e-3)
-                gate = (residual / depth_scale > innov_rel).to(self.W.dtype)
-                # Where gate fires: W ← W / innov_inflate  (forget more of the prior)
-                self.W = self.W * (1.0 - gate * (1.0 - 1.0 / innov_inflate))
+            # First call into this branch: initialise σ²_canon from the calibrated
+            # obs-variance of the very first observation (the X_canon itself was
+            # set to that obs in the N==0 init block).
+            if self.sigma2 is None:
+                self.sigma2 = sigma2_obs.clone()
 
-            denom = self.W + w_new
-            self.X_canon = (self.W * self.X_canon + w_new * X) / denom
-            self.W = (self.W + w_new).clamp(max=cap)
-            # Also accumulate raw C so frame.get_average_conf() / downstream
-            # thresholds keep working unchanged.
+            # Mahalanobis innovation gate. Under the null hypothesis (obs really
+            # drawn from N(X_canon, σ²_combined · I)), |innov|² / σ²_combined
+            # follows χ² with 3 dof. mahala2_thresh = 9 ≈ 97th percentile, so
+            # we gate on the rarest 3 % of innovations *under the noise model*.
+            if mahala2_thresh > 0:
+                innov2 = ((X - self.X_canon) ** 2).sum(dim=-1, keepdim=True)
+                mahala2 = innov2 / (self.sigma2 + sigma2_obs)
+                gate = (mahala2 > mahala2_thresh).to(self.sigma2.dtype)
+                # Inflate σ²_canon at gated pixels: less trust in prior ⇒
+                # next Kalman gain larger ⇒ fast correction of early-wrong.
+                self.sigma2 = self.sigma2 * (1.0 + gate * (inflation - 1.0))
+
+            # Standard scalar Kalman update (per pixel, scalar variance)
+            K = self.sigma2 / (self.sigma2 + sigma2_obs)
+            self.X_canon = self.X_canon + K * (X - self.X_canon)
+            self.sigma2 = (1.0 - K) * self.sigma2
+            # Floor prevents excessive certainty (= freeze). Acts like the cap on
+            # accumulated W in the linear-form derivation.
+            self.sigma2 = self.sigma2.clamp(min=sigma2_floor)
+            # Keep raw conf accumulator for downstream threshold compat.
             self.C = self.C + C
             self.N += 1
         elif filtering_mode == "weighted_spherical":
