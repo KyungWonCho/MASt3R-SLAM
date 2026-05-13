@@ -19,7 +19,7 @@ from mast3r_slam.mast3r_utils import (
     load_retriever,
     mast3r_inference_mono,
 )
-from mast3r_slam import diag
+from mast3r_slam import diag, loop_diag
 from mast3r_slam.multiprocess_utils import new_queue, try_get_msg
 from mast3r_slam.tracker import FrameTracker
 from mast3r_slam.visualization import WindowMsg, run_visualization
@@ -84,6 +84,9 @@ def run_backend(cfg, model, states, keyframes, K):
             role="loop",
             stride=diag_cfg.get("stride", 2),
         )
+    loop_inspect_cfg = cfg.get("loop_inspect")
+    if loop_inspect_cfg is not None:
+        loop_diag.init(out_dir=loop_inspect_cfg["out_dir"])
 
     device = keyframes.device
     factor_graph = FactorGraph(model, keyframes, K, device)
@@ -171,6 +174,10 @@ if __name__ == "__main__":
                         help="If set, dump per-pixel err vs conf NPZ here (7-Scenes only).")
     parser.add_argument("--diag-stride", type=int, default=2,
                         help="Per-axis pixel subsample stride for raw diag arrays.")
+    parser.add_argument("--loop-inspect-dir", default="",
+                        help="If set, record per-loop-edge acceptance summary "
+                             "(match_frac, Q_mean, X_canon-Xji residual, est poses) "
+                             "to NPZ in this dir. Lightweight; safe on local GPU.")
 
     args = parser.parse_args()
 
@@ -199,6 +206,12 @@ if __name__ == "__main__":
             role="tracking",
             stride=diag_cfg["stride"],
         )
+
+    if args.loop_inspect_dir:
+        # Loop closure inspection — lightweight, runs in backend process.
+        # We only stash the config so run_backend can pick it up; the actual
+        # init happens there.
+        config["loop_inspect"] = {"out_dir": str(args.loop_inspect_dir)}
 
     if args.calib:
         with open(args.calib, "r") as f:

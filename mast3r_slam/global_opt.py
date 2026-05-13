@@ -6,7 +6,7 @@ from mast3r_slam.geometry import (
     constrain_points_to_ray,
 )
 from mast3r_slam.mast3r_utils import mast3r_match_symmetric
-from mast3r_slam import diag
+from mast3r_slam import diag, loop_diag
 import mast3r_slam_backends
 
 
@@ -39,11 +39,13 @@ class FactorGraph:
         shape_j = [kf_j.img_true_shape for kf_j in kf_jj]
 
         diag_on = diag.get().enabled
+        loop_diag_on = loop_diag.get().enabled
+        need_points = diag_on or loop_diag_on
         sym_out = mast3r_match_symmetric(
             self.model, feat_i, pos_i, feat_j, pos_j, shape_i, shape_j,
-            return_points=diag_on,
+            return_points=need_points,
         )
-        if diag_on:
+        if need_points:
             (idx_i2j, idx_j2i, valid_match_j, valid_match_i,
              Qii, Qjj, Qji, Qij,
              Xji_full, Cji_full, Xij_full, Cij_full) = sym_out
@@ -96,9 +98,8 @@ class FactorGraph:
         self.Q_ii2jj = torch.cat([self.Q_ii2jj, Qj])
         self.Q_jj2ii = torch.cat([self.Q_jj2ii, Qi])
 
-        # Diagnostic: per-edge per-pixel pred vs GT for the cross-view pointmaps
-        # that MASt3R outputs at this loop-closure decode.
-        if diag_on:
+        # Diagnostics on this loop-closure decode batch.
+        if need_points:
             kept = valid_edges.nonzero(as_tuple=True)[0].cpu().tolist()
             Xji_kept = Xji_full[valid_edges]
             Cji_kept = Cji_full[valid_edges]
@@ -111,18 +112,50 @@ class FactorGraph:
             vmi_kept = valid_match_i
             ii_kept = ii_tensor.cpu().tolist()
             jj_kept = jj_tensor.cpu().tolist()
-            for b in range(len(kept)):
-                diag.get().record_loop_edge(
-                    frame_id_i=ii_kept[b],
-                    frame_id_j=jj_kept[b],
-                    Xji=Xji_kept[b], Cji=Cji_kept[b],
-                    Xij=Xij_kept[b], Cij=Cij_kept[b],
-                    valid_match_j=vmj_kept[b],
-                    valid_match_i=vmi_kept[b],
-                    is_consecutive=bool(consec_kept[b]),
-                    match_frac_i=float(mf_i_kept[b]),
-                    match_frac_j=float(mf_j_kept[b]),
-                )
+
+            # Per-pixel pred-vs-GT diag (heavy, optional)
+            if diag_on:
+                for b in range(len(kept)):
+                    diag.get().record_loop_edge(
+                        frame_id_i=ii_kept[b],
+                        frame_id_j=jj_kept[b],
+                        Xji=Xji_kept[b], Cji=Cji_kept[b],
+                        Xij=Xij_kept[b], Cij=Cij_kept[b],
+                        valid_match_j=vmj_kept[b],
+                        valid_match_i=vmi_kept[b],
+                        is_consecutive=bool(consec_kept[b]),
+                        match_frac_i=float(mf_i_kept[b]),
+                        match_frac_j=float(mf_j_kept[b]),
+                    )
+
+            # Per-edge lightweight loop-acceptance summary (cheap).
+            # We compare each kept Xji against keyframe i's stored canonical
+            # pointmap at the matched pixels — non-zero residual ⇒ MASt3R's
+            # symmetric decode disagrees with the keyframe's running estimate,
+            # which is exactly the false-positive signal a geometric verifier
+            # would use.
+            if loop_diag_on:
+                # Qj is the kept per-pixel joint conf; use a mean as edge summary.
+                Qj_means = Qj.float().mean(dim=(1, 2)).cpu().tolist()
+                for b in range(len(kept)):
+                    i_b = ii_kept[b]
+                    j_b = jj_kept[b]
+                    kf_i = self.frames[i_b]
+                    kf_j = self.frames[j_b]
+                    loop_diag.get().record(
+                        i=i_b, j=j_b,
+                        X_canon_i=kf_i.X_canon,
+                        Xji=Xji_kept[b],
+                        valid_match_j=vmj_kept[b],
+                        match_frac_i=mf_i_kept[b],
+                        match_frac_j=mf_j_kept[b],
+                        Q_mean=Qj_means[b],
+                        is_consecutive=consec_kept[b],
+                        T_WC_i=kf_i.T_WC.matrix()[0]
+                            if hasattr(kf_i.T_WC, "matrix") else kf_i.T_WC,
+                        T_WC_j=kf_j.T_WC.matrix()[0]
+                            if hasattr(kf_j.T_WC, "matrix") else kf_j.T_WC,
+                    )
 
         added_new_edges = valid_edges.sum() > 0
         return added_new_edges
