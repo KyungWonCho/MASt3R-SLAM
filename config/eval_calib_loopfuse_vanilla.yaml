@@ -1,0 +1,15 @@
+inherit: "config/eval_calib.yaml"
+
+# Phase 3 (loop pointmap reuse) layered on the *vanilla* fusion mode
+# instead of calibonly. Lets us isolate the loopfuse contribution from
+# the calibration contribution:
+#   loopfuse           = calibonly + loopfuse  (existing)
+#   loopfuse_vanilla   = vanilla    + loopfuse  (this)
+# Together with vanilla and calibonly baselines, the diff between
+# (vanilla, loopfuse_vanilla) attributes the same loopfuse mechanism's
+# effect on top of the raw-c fusion.
+tracking:
+  # filtering_mode inherits from eval_calib.yaml → weighted_pointmap (vanilla)
+  loop_fuse:
+    enabled: true
+    exclude_consecutive: false
