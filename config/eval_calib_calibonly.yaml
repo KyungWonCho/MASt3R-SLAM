@@ -1,0 +1,12 @@
+inherit: "config/eval_calib.yaml"
+
+# Ablation: calibration only (no cap, no innovation gate).
+# Tests whether the calibrated weight exponent alone moves ATE/geometry.
+tracking:
+  filtering_mode: weighted_pointmap_calib
+  fusion:
+    sigma_a: 0.708
+    sigma_p: -0.372       # calibrated
+    sigma2_floor: 1.0e-10 # effectively disabled (no cap)
+    mahala2_thresh: 0     # disabled
+    inflation: 1.0

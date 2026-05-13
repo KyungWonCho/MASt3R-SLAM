@@ -1,0 +1,14 @@
+inherit: "config/eval_calib.yaml"
+
+# Ablation: calibration + cap (no innovation gate).
+# Isolates the innovation-gate contribution from the rest. If `fusion`
+# beats this but this matches vanilla, the innovation gate carries
+# the win. If this already beats vanilla, calibration+cap is enough.
+tracking:
+  filtering_mode: weighted_pointmap_calib
+  fusion:
+    sigma_a: 0.708
+    sigma_p: -0.372       # calibrated
+    sigma2_floor: 5.0e-3  # cap on σ²
+    mahala2_thresh: 0     # disabled
+    inflation: 1.0
