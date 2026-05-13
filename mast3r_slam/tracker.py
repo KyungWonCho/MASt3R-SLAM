@@ -10,6 +10,7 @@ from mast3r_slam.geometry import (
 from mast3r_slam.nonlinear_optimizer import check_convergence, huber
 from mast3r_slam.config import config
 from mast3r_slam.mast3r_utils import mast3r_match_asymmetric
+from mast3r_slam import diag
 
 
 class FrameTracker:
@@ -33,6 +34,17 @@ class FrameTracker:
         )
         # Save idx for next
         self.idx_f2k = idx_f2k.clone()
+
+        # Diagnostic: per-pixel err vs conf for the pointmap that will be fused
+        # into the keyframe (Xkf in frame coord, fused after T_CkCf transform).
+        if diag.get().enabled:
+            diag.get().record_tracking_pair(
+                frame_id_f=frame.frame_id,
+                frame_id_k=keyframe.frame_id,
+                Xkf=Xkf,
+                Ckf=Ckf,
+                valid_match=valid_match_k,
+            )
 
         # Get rid of batch dim
         idx_f2k = idx_f2k[0]

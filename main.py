@@ -19,6 +19,7 @@ from mast3r_slam.mast3r_utils import (
     load_retriever,
     mast3r_inference_mono,
 )
+from mast3r_slam import diag
 from mast3r_slam.multiprocess_utils import new_queue, try_get_msg
 from mast3r_slam.tracker import FrameTracker
 from mast3r_slam.visualization import WindowMsg, run_visualization
@@ -73,6 +74,16 @@ def relocalization(frame, keyframes, factor_graph, retrieval_database):
 
 def run_backend(cfg, model, states, keyframes, K):
     set_global_config(cfg)
+
+    # Init diag collector in backend process for loop-closure edges
+    diag_cfg = cfg.get("diag")
+    if diag_cfg is not None:
+        diag.init(
+            out_dir=diag_cfg["out_dir"],
+            rgb_files=diag_cfg["rgb_files"],
+            role="loop",
+            stride=diag_cfg.get("stride", 2),
+        )
 
     device = keyframes.device
     factor_graph = FactorGraph(model, keyframes, K, device)
@@ -156,6 +167,10 @@ if __name__ == "__main__":
     parser.add_argument("--save-as", default="default")
     parser.add_argument("--no-viz", action="store_true")
     parser.add_argument("--calib", default="")
+    parser.add_argument("--diag-dir", default="",
+                        help="If set, dump per-pixel err vs conf NPZ here (7-Scenes only).")
+    parser.add_argument("--diag-stride", type=int, default=2,
+                        help="Per-axis pixel subsample stride for raw diag arrays.")
 
     args = parser.parse_args()
 
@@ -170,6 +185,20 @@ if __name__ == "__main__":
     dataset = load_dataset(args.dataset)
     dataset.subsample(config["dataset"]["subsample"])
     h, w = dataset.get_img_shape()[0]
+
+    if args.diag_dir:
+        diag_cfg = {
+            "out_dir": str(args.diag_dir),
+            "rgb_files": [str(p) for p in dataset.rgb_files],
+            "stride": int(args.diag_stride),
+        }
+        config["diag"] = diag_cfg
+        diag.init(
+            out_dir=diag_cfg["out_dir"],
+            rgb_files=diag_cfg["rgb_files"],
+            role="tracking",
+            stride=diag_cfg["stride"],
+        )
 
     if args.calib:
         with open(args.calib, "r") as f:
@@ -309,6 +338,10 @@ if __name__ == "__main__":
             print(f"FPS: {FPS}")
         i += 1
 
+    total_time = time.time() - fps_timer
+    final_fps = i / total_time if total_time > 0 else 0.0
+    print(f"Final FPS: {final_fps:.3f}  (frames={i}, keyframes={len(keyframes)}, time={total_time:.2f}s)")
+
     if dataset.save_results:
         save_dir, seq_name = eval.prepare_savedir(args, dataset)
         eval.save_traj(save_dir, f"{seq_name}.txt", dataset.timestamps, keyframes)
@@ -316,11 +349,20 @@ if __name__ == "__main__":
             save_dir,
             f"{seq_name}.ply",
             keyframes,
-            last_msg.C_conf_threshold,
+            0.0 if args.no_viz else last_msg.C_conf_threshold,
         )
         eval.save_keyframes(
             save_dir / "keyframes" / seq_name, dataset.timestamps, keyframes
         )
+        import json
+        stats = {
+            "fps": final_fps,
+            "total_time_s": total_time,
+            "frames": int(i),
+            "keyframes": int(len(keyframes)),
+        }
+        with open(save_dir / f"{seq_name}_stats.json", "w") as f:
+            json.dump(stats, f, indent=2)
     if save_frames:
         savedir = pathlib.Path(f"logs/frames/{datetime_now}")
         savedir.mkdir(exist_ok=True, parents=True)
@@ -329,6 +371,7 @@ if __name__ == "__main__":
             frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
             cv2.imwrite(f"{savedir}/{i}.png", frame)
 
+    diag.get().flush()
     print("done")
     backend.join()
     if not args.no_viz:

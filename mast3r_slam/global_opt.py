@@ -6,6 +6,7 @@ from mast3r_slam.geometry import (
     constrain_points_to_ray,
 )
 from mast3r_slam.mast3r_utils import mast3r_match_symmetric
+from mast3r_slam import diag
 import mast3r_slam_backends
 
 
@@ -37,18 +38,18 @@ class FactorGraph:
         shape_i = [kf_i.img_true_shape for kf_i in kf_ii]
         shape_j = [kf_j.img_true_shape for kf_j in kf_jj]
 
-        (
-            idx_i2j,
-            idx_j2i,
-            valid_match_j,
-            valid_match_i,
-            Qii,
-            Qjj,
-            Qji,
-            Qij,
-        ) = mast3r_match_symmetric(
-            self.model, feat_i, pos_i, feat_j, pos_j, shape_i, shape_j
+        diag_on = diag.get().enabled
+        sym_out = mast3r_match_symmetric(
+            self.model, feat_i, pos_i, feat_j, pos_j, shape_i, shape_j,
+            return_points=diag_on,
         )
+        if diag_on:
+            (idx_i2j, idx_j2i, valid_match_j, valid_match_i,
+             Qii, Qjj, Qji, Qij,
+             Xji_full, Cji_full, Xij_full, Cij_full) = sym_out
+        else:
+            (idx_i2j, idx_j2i, valid_match_j, valid_match_i,
+             Qii, Qjj, Qji, Qij) = sym_out
 
         batch_inds = torch.arange(idx_i2j.shape[0], device=idx_i2j.device)[
             :, None
@@ -94,6 +95,34 @@ class FactorGraph:
         self.valid_match_i = torch.cat([self.valid_match_i, valid_match_i])
         self.Q_ii2jj = torch.cat([self.Q_ii2jj, Qj])
         self.Q_jj2ii = torch.cat([self.Q_jj2ii, Qi])
+
+        # Diagnostic: per-edge per-pixel pred vs GT for the cross-view pointmaps
+        # that MASt3R outputs at this loop-closure decode.
+        if diag_on:
+            kept = valid_edges.nonzero(as_tuple=True)[0].cpu().tolist()
+            Xji_kept = Xji_full[valid_edges]
+            Cji_kept = Cji_full[valid_edges]
+            Xij_kept = Xij_full[valid_edges]
+            Cij_kept = Cij_full[valid_edges]
+            consec_kept = consecutive_edges[valid_edges].cpu().tolist()
+            mf_i_kept = match_frac_i[valid_edges].cpu().tolist()
+            mf_j_kept = match_frac_j[valid_edges].cpu().tolist()
+            vmj_kept = valid_match_j  # already filtered
+            vmi_kept = valid_match_i
+            ii_kept = ii_tensor.cpu().tolist()
+            jj_kept = jj_tensor.cpu().tolist()
+            for b in range(len(kept)):
+                diag.get().record_loop_edge(
+                    frame_id_i=ii_kept[b],
+                    frame_id_j=jj_kept[b],
+                    Xji=Xji_kept[b], Cji=Cji_kept[b],
+                    Xij=Xij_kept[b], Cij=Cij_kept[b],
+                    valid_match_j=vmj_kept[b],
+                    valid_match_i=vmi_kept[b],
+                    is_consecutive=bool(consec_kept[b]),
+                    match_frac_i=float(mf_i_kept[b]),
+                    match_frac_j=float(mf_j_kept[b]),
+                )
 
         added_new_edges = valid_edges.sum() > 0
         return added_new_edges

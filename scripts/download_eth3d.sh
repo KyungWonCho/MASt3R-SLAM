@@ -3,15 +3,15 @@ dest="datasets/eth3d/train"
 mkdir -p "$dest"
 
 sequences=(
-    cables_1
-    cables_2
-    cables_3
-    camera_shake_1
-    camera_shake_2
-    camera_shake_3
-    ceiling_1
-    ceiling_2
-    desk_3
+    # cables_1
+    # cables_2
+    # cables_3
+    # camera_shake_1
+    # camera_shake_2
+    # camera_shake_3
+    # ceiling_1
+    # ceiling_2
+    # desk_3
     desk_changing_1
     einstein_1
     einstein_2

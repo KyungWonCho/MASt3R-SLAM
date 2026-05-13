@@ -139,7 +139,8 @@ def mast3r_inference_mono(model, frame):
     return Xii, Cii
 
 
-def mast3r_match_symmetric(model, feat_i, pos_i, feat_j, pos_j, shape_i, shape_j):
+def mast3r_match_symmetric(model, feat_i, pos_i, feat_j, pos_j, shape_i, shape_j,
+                           return_points=False):
     X, C, D, Q = mast3r_decode_symmetric_batch(
         model, feat_i, pos_i, feat_j, pos_j, shape_i, shape_j
     )
@@ -148,6 +149,7 @@ def mast3r_match_symmetric(model, feat_i, pos_i, feat_j, pos_j, shape_i, shape_j
     b = X.shape[1]
 
     Xii, Xji, Xjj, Xij = X[0], X[1], X[2], X[3]
+    Cii, Cji, Cjj, Cij = C[0], C[1], C[2], C[3]
     Dii, Dji, Djj, Dij = D[0], D[1], D[2], D[3]
     Qii, Qji, Qjj, Qij = Q[0], Q[1], Q[2], Q[3]
 
@@ -168,7 +170,7 @@ def mast3r_match_symmetric(model, feat_i, pos_i, feat_j, pos_j, shape_i, shape_j
     valid_match_j = valid_match_2[:match_b]
     valid_match_i = valid_match_2[match_b:]
 
-    return (
+    out = [
         idx_i2j,
         idx_j2i,
         valid_match_j,
@@ -177,7 +179,14 @@ def mast3r_match_symmetric(model, feat_i, pos_i, feat_j, pos_j, shape_i, shape_j
         Qjj.view(b, -1, 1),
         Qji.view(b, -1, 1),
         Qij.view(b, -1, 1),
-    )
+    ]
+    if return_points:
+        # Per-edge per-pixel pointmaps and pointmap-confs, flattened to (b, H*W, c)
+        out.append(Xji.reshape(b, -1, 3))
+        out.append(Cji.reshape(b, -1, 1))
+        out.append(Xij.reshape(b, -1, 3))
+        out.append(Cij.reshape(b, -1, 1))
+    return tuple(out)
 
 
 @torch.inference_mode
