@@ -4,6 +4,35 @@
 
 ---
 
+## TL;DR — 최종 7 variant 결과 (2026-05-14)
+
+7 variant × 7 scene 7-Scenes 평가 후 정리:
+
+| variant | ATE mean | Acc mean | Comp mean | Chamfer mean | 비고 |
+|---|---|---|---|---|---|
+| vanilla | 0.0471 | 0.0870 | 0.0652 | 0.0761 | baseline |
+| calibonly (w=c^0.74) | 0.0478 | 0.0849 | **0.0634** | **0.0741** | geometry winner |
+| caponly (w=c, cap=200) | 0.0477 | 0.0859 | 0.0649 | 0.0754 | 효과 미미 |
+| calibcap (w=c^0.74, cap=120) | 0.0479 | **0.0848** | **0.0634** | **0.0741** | calibonly와 동일 |
+| fusion (calib+cap+process noise) | 0.0538 | 0.0884 | 0.0663 | 0.0773 | 큰 손해 |
+| loopfuse (calibonly + loop pointmap reuse) | 0.0479 | 0.0857 | 0.0639 | 0.0748 | 효과 mixed |
+| **loopfuse_vanilla** (vanilla + loop pointmap reuse) | **0.0469** | 0.0868 | 0.0655 | 0.0762 | **ATE winner** |
+
+**메커니즘 차원 정리:**
+
+| 메커니즘 | ATE 효과 | Geometry 효과 |
+|---|---|---|
+| Calibration (w=c^0.74) | -1.5% (살짝 손해) | **-2~3% (개선)** |
+| Cap on Σw | ~0 (안 닿아서 효과 없음) | ~0 |
+| Process noise (forget=0.95) | **+14% (큰 손해)** | mixed |
+| **Loop pointmap reuse (vanilla 위)** | **-0.4% (개선)** | ~0 |
+
+**Loopfuse_vanilla** = vanilla baseline + loop closure에서 폐기되던 cross-view pointmap (`Xij`, `Xji`)을 *MASt3R-internal local Sim3*로 변환해서 keyframe canonical에 재fusion. 5/7 scene에서 ATE 개선, stairs에서 -7% (가장 큰 개선).
+
+**결론:** ATE 개선 원하면 `loopfuse_vanilla`, geometry 개선 원하면 `calibonly`. 두 메커니즘은 부분적으로 간섭하여 compound 안 됨 (loopfuse + calibonly = loopfuse, calibonly의 ATE 손해를 loopfuse가 못 메움).
+
+---
+
 ## 셋업
 
 - **무엇을 기록하는가**: 두 군데 호출 사이트에서 per-pair per-pixel `(err, conf, z_gt, valid_match)` 를 GT 대비로 저장.
