@@ -116,10 +116,61 @@ Fusion 설계에 대한 함의: tracking에서 view_angle gate는 **불필요**.
 
 ---
 
+## 관찰 5.5 — Loop closure 수용에 기하학적 검증이 없음
+
+`global_opt.py:add_factors` 의 수용 기준을 코드 확인 결과:
+1. `Qj = sqrt(Qii · Qji) > Q_conf` (per-pixel joint conf 임계치)
+2. `match_frac > min_match_frac` (보통 0.1), 양방향 통과 필요
+3. consecutive edge (`jj == ii+1`) 는 threshold 면제
+
+**확인된 *없음*:**
+- ❌ RANSAC / fundamental matrix 검증 (애초에 generic camera 모델이라 F-matrix 사용 불가)
+- ❌ Relative pose 추정 후 reprojection error 체크
+- ❌ Epipolar geometry 검증
+- ❌ Depth scale consistency 검증
+
+즉 **순수 neural verification** — MASt3R conf가 "기하학적으로 일관된 매칭"이라고 *말해주길* 가정. 반복 텍스처 (복도, 책장, 계단)에서 visually similar but spatially wrong matching이 통과 가능. retrieval로 찾아오는 멀리 떨어진 keyframe pair 에서 특히 위험.
+
+**Diag로 확인된 증상**: chess loop 26개 전부 baseline 1cm — *진짜 loop가 거의 안 잡힘*. retrieval이 통과시키는 게 사실상 인접 KF뿐 (또는 적어도 우리가 본 7-Scenes test seq에서는).
+
+**Generic camera 모델에서도 가능한 검증법** (Phase 4 후보):
+
+1. **3D-3D Sim3 RANSAC (Procrustes/Umeyama)**: matched pixel 쌍 `(p_a in i, p_b in j)` 에서 `(X_ii(p_a), X_jj(p_b))` 가지고 RANSAC. camera 모델 무관.
+2. **Per-pixel pointmap residual gate** (가장 단순): 매치된 픽셀에서 `|X_ii(p_a) - X_ji(p_b)|` (둘 다 i의 좌표계). 비용 거의 0, 이미 decode된 값들.
+3. **Ray-point consistency**: 각 카메라의 unproject ray (generic 모델에 내장) 이용한 distance gate.
+
+**제일 매력적인 건 2번** — 추가 연산 없고 camera 모델 무관.
+
+---
+
 ## 관찰 5 — Diag 차원에서 Calib과 No_calib은 구분 불가
 
 `chess` 양 mode로 검증: tracking err_rmse 0.479 (calib) vs 0.493 (no_calib), σ fit 파라미터 ~2% 차이.
 이건 *원리적으로 예상*되는 결과 — diag는 raw MASt3R decoder 출력을 측정. 그 출력은 intrinsic 사용 여부와 무관. Calib/no_calib 차이는 *downstream의 pose-estimation loop* 에서 발생. 그래서 나머지 6 scene에서 no_calib을 skip한 게 정보 손실 없음.
+
+---
+
+## 구현 상태 (2026-05-13)
+
+| Phase | 내용 | 상태 |
+|---|---|---|
+| 1+2 (통합) | `weighted_pointmap_calib` filtering mode: calibrated weight `c^0.74` + cap=200 + per-pixel innovation gate (relative residual > 0.3 ⇒ W ÷= 4) | ✅ 구현됨 (`mast3r_slam/frame.py`), branch `diag/7-scenes` |
+| 3 | Loop edge에서 폐기되는 X_ji 재활용 | ⏳ 미구현 |
+| 4 | Loop closure geometric verification (per-pixel pointmap residual gate 또는 3D-3D RANSAC) | ⏳ 미구현 |
+
+**Phase 1+2 코드 디테일:**
+- `Frame` dataclass에 `W` (calibrated 누적 precision) 필드 추가, 기존 `C` 는 raw 누적으로 유지 (downstream conf threshold 호환)
+- 새 config 섹션 `tracking.fusion`: `w_exp`, `cap`, `innov_rel`, `innov_inflate` 4개 노브
+- `config/eval_calib_fusion.yaml`, `config/eval_no_calib_fusion.yaml` 생성 — `eval_7_scenes.sh --variant fusion` 로 사용
+- 기존 `weighted_pointmap` 그대로 두고 새 mode 추가 → A/B 비교 가능
+
+**평가 중 (서버, 4-GPU 병렬):**
+- vanilla (`config/eval_calib.yaml`) vs fusion (`config/eval_calib_fusion.yaml`) on 7-Scenes 전 scene
+- `scripts/eval_7_scenes.sh --variant {vanilla,fusion} --print` 로 ATE + pointmap geometry (Accuracy/Completion/Chamfer) 비교
+- 기대: 
+  - ATE 개선 (특히 chess/fire 같은 early-wrong 많은 scene)
+  - Pointmap RMSE 개선 (cap 효과)
+  - innovation gate 비율 vs scene 특성 상관관계 확인
 
 ---
 
@@ -152,6 +203,15 @@ Cap+calibration는 *freeze 방지*만 하지, early-wrong을 *감지하거나 �
 ### Phase 3 — Loop pointmap 재활용 (Phase 1, 2와 직교)
 
 view_angle > ~5° 의 real loop edge에서 `Xji`, `Xij`를 각각 keyframe_j, keyframe_i 의 `update_pointmap` 에 재투입. Decode 비용은 이미 matching 단계에서 지불됨 → 사실상 *공짜로* 최대로 decorrelated된 시점의 관측 추가. early-wrong에 대한 *간접* 처방: linear monotone fusion이 갇혀 있던 temporal neighborhood *바깥의* 정보를 keyframe에 주입.
+
+### Phase 4 — Loop closure geometric verification (관찰 5.5 참조)
+
+현재 코드는 conf + match_frac threshold만으로 loop edge 수용 → false-positive 위험. Generic camera 모델 제약 하에서 가능한 검증법:
+
+- **Per-pixel pointmap residual gate** (가장 가벼움): `|X_ii(p_a) - X_ji(p_b)|` 가 임계치 초과하는 픽셀 비율로 edge reject. 추가 연산 없음 — 이미 decode된 X_ii, X_ji 사용.
+- **3D-3D Sim3 RANSAC**: matched 3D 점 대응에서 Sim3 fit → inlier ratio gate. 더 robust하지만 RANSAC 비용 추가.
+
+지금은 chess loop가 다 baseline 1cm (= 사실상 consecutive)이라 false-positive 노출이 안 보임. **다른 dataset (TUM, ETH3D)이나 더 긴 시퀀스에서 효과 클 것**.
 
 ---
 
