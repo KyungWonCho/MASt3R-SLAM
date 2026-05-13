@@ -29,8 +29,14 @@ import numpy as np
 # If we treat σ² as the precision-1, the optimal inverse-variance weight is
 # w ∝ 1/σ² = c^(-2 p_meas) ≈ c^0.6.  We use this in the simulated reweighting.
 P_MEAS = -0.3
-W_EXP = -2.0 * P_MEAS   # ≈ 0.6
+W_EXP = -2.0 * P_MEAS   # ≈ 0.6  (this gets overwritten in main with the actual fit)
 C_CAP_CANDIDATES = (100.0, 300.0, 1000.0)  # accumulated-C caps to simulate
+
+# Defaults for the fusion simulation (overridden by the actual aggregate fit in main).
+SIM_A = 0.708
+SIM_P = -0.372
+SIM_W_EXP = -2.0 * SIM_P     # ≈ 0.744; calibrated optimal weight exponent
+SIM_CAP = 200.0              # accumulated-W cap; floor on sigma2 ≈ inverse
 
 
 # ---------------------------------------------------------------------- #
@@ -191,6 +197,232 @@ def plot_kf_err_trajectories(per_pair, out_path, role="tracking", n_plot=12):
     for ax in axes.flat[len(items):]:
         ax.axis("off")
     fig.suptitle(f"Per-keyframe err & conf trajectories ({role})")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=110)
+    plt.close(fig)
+
+
+# ---------------------------------------------------------------------- #
+# Fusion simulation: compare schemes per-pixel per-keyframe.
+#
+# All schemes operate on a (n_pairs, n_pix) per-keyframe sequence of
+# observations (err_obs_magnitude, conf). For each scheme we propagate
+# E[|err_canon|^2] analytically per pixel assuming zero-mean independent
+# observation errors (i.e., we're computing the variance of the running
+# fused estimate, with the observed err magnitude as the per-pair std).
+# This isn't a Monte Carlo of signed directions, but it gives the
+# correct ranking under the usual zero-mean noise assumption.
+#
+# Innovation gating is NOT modelled here (requires directional MC). The
+# four deterministic schemes still cleanly separate (i) miscalibrated
+# linear monotone, (ii) recalibrated linear monotone, (iii) recalibrated
+# + cap, (iv) per-pixel KF-lite with the calibrated noise model.
+# ---------------------------------------------------------------------- #
+
+def _fuse_linear_monotone(c, err_obs, w_of_c):
+    """Linear weighted average, monotone-growing W. Returns E[|err_canon|^2] (n_pix,).
+       c, err_obs: (n_pairs, n_pix) float arrays.  w_of_c: callable c->weight."""
+    n_pairs = c.shape[0]
+    w = w_of_c(c)
+    mean_err2 = err_obs[0].astype(np.float64) ** 2
+    W = w[0].astype(np.float64)
+    for i in range(1, n_pairs):
+        w_i = w[i].astype(np.float64)
+        e2 = err_obs[i].astype(np.float64) ** 2
+        denom = W + w_i
+        a_old = W / denom
+        a_new = w_i / denom
+        mean_err2 = a_old ** 2 * mean_err2 + a_new ** 2 * e2
+        W = W + w_i
+    return mean_err2
+
+
+def _fuse_linear_capped(c, err_obs, w_of_c, cap):
+    """Linear weighted average with cap on accumulated W. (Phase 1 candidate.)"""
+    n_pairs = c.shape[0]
+    w = w_of_c(c)
+    mean_err2 = err_obs[0].astype(np.float64) ** 2
+    W = np.minimum(w[0].astype(np.float64), cap)
+    for i in range(1, n_pairs):
+        w_i = w[i].astype(np.float64)
+        e2 = err_obs[i].astype(np.float64) ** 2
+        denom = W + w_i
+        a_old = W / denom
+        a_new = w_i / denom
+        mean_err2 = a_old ** 2 * mean_err2 + a_new ** 2 * e2
+        W = np.minimum(W + w_i, cap)
+    return mean_err2
+
+
+def _fuse_kf_lite(c, err_obs, a_meas, p_meas, sigma2_floor=None):
+    """Per-pixel Kalman with calibrated noise model σ²(c) = (a · c^p)².
+       (Phase C candidate.) Each pixel keeps its own σ², updated proper KF style.
+       Optional floor on σ² acts like the cap on W in the linear form."""
+    n_pairs = c.shape[0]
+    sigma2_obs = (a_meas * c.astype(np.float64) ** p_meas) ** 2
+    sigma2_canon = sigma2_obs[0].copy()
+    mean_err2 = err_obs[0].astype(np.float64) ** 2
+    for i in range(1, n_pairs):
+        s2_obs = sigma2_obs[i]
+        K = sigma2_canon / (sigma2_canon + s2_obs)
+        e2 = err_obs[i].astype(np.float64) ** 2
+        mean_err2 = (1 - K) ** 2 * mean_err2 + K ** 2 * e2
+        sigma2_canon = (1 - K) * sigma2_canon
+        if sigma2_floor is not None:
+            sigma2_canon = np.maximum(sigma2_canon, sigma2_floor)
+    return mean_err2
+
+
+def _fuse_kf_innov(c, err_obs, a_meas, p_meas,
+                   mahala_thresh=4.0, inflation=4.0, sigma2_floor=None):
+    """KF-lite + innovation-based variance inflation: when the per-pair
+       innovation looks too large for the current (σ²_canon + σ²_obs),
+       inflate σ²_canon → next obs immediately gets larger Kalman gain.
+       This is the mechanism that enables fast correction of early-wrong.
+
+       We use a proxy for the per-pixel innovation magnitude:
+            innov² ≈ E[|err_canon|²] + E[|err_obs|²]
+       (i.e. the expected squared distance under the zero-mean assumption,
+       which is the right scale even when we don't know signed direction).
+       The Mahalanobis-like test then asks whether the observation's
+       expected residual variance dwarfs the current canonical's variance.
+    """
+    n_pairs = c.shape[0]
+    sigma2_obs = (a_meas * c.astype(np.float64) ** p_meas) ** 2
+    sigma2_canon = sigma2_obs[0].copy()
+    mean_err2 = err_obs[0].astype(np.float64) ** 2
+    for i in range(1, n_pairs):
+        s2_obs = sigma2_obs[i]
+        e2 = err_obs[i].astype(np.float64) ** 2
+        # Proxy innovation magnitude² ≈ mean_err2 + e2 (independent zero-mean)
+        innov2_proxy = mean_err2 + e2
+        denom = sigma2_canon + s2_obs
+        mahala2 = innov2_proxy / np.maximum(denom, 1e-12)
+        # Inflate σ²_canon where mahala exceeds threshold
+        inflate_mask = mahala2 > mahala_thresh
+        sigma2_canon = np.where(inflate_mask, sigma2_canon * inflation, sigma2_canon)
+        # Now run the standard KF step with (possibly inflated) sigma2_canon
+        K = sigma2_canon / (sigma2_canon + s2_obs)
+        mean_err2 = (1 - K) ** 2 * mean_err2 + K ** 2 * e2
+        sigma2_canon = (1 - K) * sigma2_canon
+        if sigma2_floor is not None:
+            sigma2_canon = np.maximum(sigma2_canon, sigma2_floor)
+    return mean_err2
+
+
+def simulate_fusion_for_scene(scene, root, a_meas, p_meas, cap):
+    """Load tracking NPZ for scene, run per-pixel fusion sim per keyframe.
+       Returns list of dicts (one per (scene, kf, scheme))."""
+    npz_path = root / scene / "calib" / "tracking.npz"
+    d = load_npz(npz_path)
+    if d is None:
+        return []
+    err_all = d["err"]
+    conf_all = d["conf"]
+    offs = d["pair_offset"]
+    n_pix_per_pair = d["n_pixels"]
+    targets = d["frame_id_target"]
+    preds = d["frame_id_pred"]
+
+    by_kf = defaultdict(list)
+    for i in range(len(n_pix_per_pair)):
+        by_kf[int(targets[i])].append(i)
+
+    w_raw = lambda c: c.astype(np.float64)
+    w_exp = -2.0 * p_meas
+    w_calib = lambda c: np.maximum(c.astype(np.float64), 1e-6) ** w_exp
+    # sigma2 floor matched to the cap: floor ≈ (a · c_typ^p)² · (c_typ^w_exp / cap)
+    # — handwavy correspondence; we just pass cap-equivalent as sigma2_floor candidate
+    sigma2_floor = None  # leave KF-lite without floor first; user can add later
+
+    results = []
+    for kf, pair_idx in by_kf.items():
+        if len(pair_idx) < 3:
+            continue
+        pair_idx.sort(key=lambda i: int(preds[i]))
+        n_pairs = len(pair_idx)
+        n_pix_expected = int(n_pix_per_pair[pair_idx[0]])
+        if any(int(n_pix_per_pair[i]) != n_pix_expected for i in pair_idx):
+            continue  # rare: pair size mismatch
+
+        err_stack = np.zeros((n_pairs, n_pix_expected), dtype=np.float32)
+        conf_stack = np.zeros((n_pairs, n_pix_expected), dtype=np.float32)
+        for k, i in enumerate(pair_idx):
+            a, b = int(offs[i]), int(offs[i + 1])
+            err_stack[k] = err_all[a:b]
+            conf_stack[k] = conf_all[a:b]
+
+        # Only consider pixels valid (finite) in every pair of this keyframe
+        valid_all = np.all(
+            np.isfinite(err_stack) & np.isfinite(conf_stack) & (conf_stack > 0),
+            axis=0,
+        )
+        n_v = int(valid_all.sum())
+        if n_v < 100:
+            continue
+        ev = err_stack[:, valid_all]
+        cv = conf_stack[:, valid_all]
+
+        sims = {}
+        # (0) Trivial baselines
+        sims["first_only"] = ev[0].astype(np.float64) ** 2
+        sims["last_only"] = ev[-1].astype(np.float64) ** 2
+        sims["oracle_best"] = np.min(ev.astype(np.float64) ** 2, axis=0)
+        # (i) Current code: w = c, monotone
+        sims["current_w=c"] = _fuse_linear_monotone(cv, ev, w_raw)
+        # (ii) Calibration only (no cap): w = c^0.74
+        sims["calib_w=c^0.74"] = _fuse_linear_monotone(cv, ev, w_calib)
+        # (iii) Calibration + cap (Phase 1 proposal)
+        sims[f"calib+cap_{int(cap)}"] = _fuse_linear_capped(cv, ev, w_calib, cap)
+        # (iv) KF-lite with calibrated noise model (Phase C without floor)
+        sims["kf_lite"] = _fuse_kf_lite(cv, ev, a_meas, p_meas, sigma2_floor=None)
+        # (v) Phase 2 candidate: KF-lite + innovation inflation.
+        #     This is the only scheme that can correct early-wrong "quickly".
+        sims["kf_lite+innov_inflate"] = _fuse_kf_innov(
+            cv, ev, a_meas, p_meas,
+            mahala_thresh=4.0, inflation=4.0, sigma2_floor=None,
+        )
+
+        for name, m2 in sims.items():
+            results.append({
+                "scene": scene,
+                "kf": kf,
+                "n_pairs": n_pairs,
+                "n_pix": n_v,
+                "scheme": name,
+                "fused_rmse": float(np.sqrt(m2.mean())),
+                "fused_median": float(np.sqrt(np.median(m2))),
+                "fused_p90": float(np.sqrt(np.percentile(m2, 90))),
+            })
+    return results
+
+
+def plot_scheme_comparison(sim_rows, out_path):
+    """Per-scene boxplot of fused_rmse, one box per scheme."""
+    by_scheme = defaultdict(list)
+    by_scene_scheme = defaultdict(lambda: defaultdict(list))
+    for r in sim_rows:
+        by_scheme[r["scheme"]].append(r["fused_rmse"])
+        by_scene_scheme[r["scene"]][r["scheme"]].append(r["fused_rmse"])
+    schemes = list(by_scheme.keys())
+    scenes = sorted(by_scene_scheme.keys())
+
+    fig, axes = plt.subplots(1, len(scenes), figsize=(3.0 * len(scenes), 4.5),
+                             squeeze=False, sharey=True)
+    for ax, scene in zip(axes[0], scenes):
+        data = [by_scene_scheme[scene][s] for s in schemes]
+        ax.boxplot(data, tick_labels=[s.replace("calib+", "c+\n") for s in schemes])
+        ax.set_xticklabels(
+            [s.replace("calib+", "c+\n").replace("kf_lite", "kf-\nlite")
+             .replace("oracle_best", "oracle\nbest").replace("first_only", "first")
+             .replace("last_only", "last").replace("current_w=c", "cur")
+             .replace("calib_w=c^0.74", "calib") for s in schemes],
+            rotation=0, fontsize=8,
+        )
+        ax.set_title(scene)
+        ax.grid(True, alpha=0.3)
+    axes[0][0].set_ylabel("per-kf fused err RMSE (m)")
+    fig.suptitle("Fusion scheme comparison — per-keyframe fused err (lower is better)")
     fig.tight_layout()
     fig.savefig(out_path, dpi=110)
     plt.close(fig)
@@ -663,6 +895,33 @@ def main():
         aligns=["---", "---:", "---:", "---:", "---:", "---:", "---:", "---:"]))
 
     # ------------------------------------------------------------------ #
+    # Fusion simulation across schemes (uses cross-scene a, p from §2)
+    # ------------------------------------------------------------------ #
+    sim_rows = []
+    if "tracking" in agg_sigma and np.isfinite(agg_sigma["tracking"]["p"]):
+        a_used = float(agg_sigma["tracking"]["a"])
+        p_used = float(agg_sigma["tracking"]["p"])
+        cap_used = SIM_CAP
+        print(f"\nRunning fusion simulation with a={a_used:.3g} p={p_used:.3f} cap={cap_used}")
+        for scene in scenes:
+            scene_dir = root / scene / "calib"
+            if not scene_dir.exists():
+                continue
+            sim_rows.extend(simulate_fusion_for_scene(
+                scene, root, a_used, p_used, cap_used,
+            ))
+        if sim_rows:
+            # Dump CSV
+            sim_csv = out_dir / "fusion_sim.csv"
+            keys = list(sim_rows[0].keys())
+            with open(sim_csv, "w", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=keys)
+                w.writeheader()
+                for r in sim_rows:
+                    w.writerow(r)
+            plot_scheme_comparison(sim_rows, out_dir / "fusion_scheme_boxplot.png")
+
+    # ------------------------------------------------------------------ #
     # NEW: fusion-focused analyses (cap+calibration evidence)
     # ------------------------------------------------------------------ #
 
@@ -826,8 +1085,88 @@ def main():
         aligns=["---", "---:", "---:", "---:", "---:", "---:", "---:", "---:"],
     ))
 
-    # Existing 7f (renumbered 13)
-    md.append("\n## 13. View angle distribution (sanity check — \"tracking view angles small?\")\n")
+    # 7k. Fusion simulation comparison
+    if sim_rows:
+        md.append("\n## 13. Fusion simulation: per-keyframe fused err under different schemes\n")
+        md.append("For each tracking keyframe, we simulate per-pixel fusion under each scheme "
+                  "and report the resulting fused err RMSE (averaged across pixels of that keyframe). "
+                  "**lower is better**. `oracle_best` = pick the single best pair per pixel "
+                  "(upper bound on what any combination scheme could achieve from these obs).\n\n"
+                  f"Parameters used: a={agg_sigma['tracking']['a']:.3g}, "
+                  f"p={agg_sigma['tracking']['p']:.3f}, "
+                  f"calibrated weight = c^{-2*agg_sigma['tracking']['p']:.3f}, cap={SIM_CAP:.0f}.\n")
+
+        # Table: per-scene aggregate per scheme
+        by_scene_scheme = defaultdict(lambda: defaultdict(list))
+        for r in sim_rows:
+            by_scene_scheme[r["scene"]][r["scheme"]].append(r["fused_rmse"])
+        schemes_order = ["oracle_best", "first_only", "last_only",
+                         "current_w=c", "calib_w=c^0.74",
+                         f"calib+cap_{int(SIM_CAP)}",
+                         "kf_lite", "kf_lite+innov_inflate"]
+        headers = ["scene"] + [s.replace("calib+cap_", "cap+\n") for s in schemes_order]
+        rows = []
+        for scene in sorted(by_scene_scheme.keys()):
+            row = [scene]
+            for s in schemes_order:
+                vals = by_scene_scheme[scene].get(s, [])
+                if not vals:
+                    row.append("—")
+                else:
+                    row.append(f"{np.mean(vals):.3f}")
+            rows.append(row)
+        md.append(md_table(headers, rows,
+                           aligns=["---"] + ["---:"] * len(schemes_order)))
+
+        # Aggregate (all scenes pooled)
+        md.append("\n**All scenes pooled (mean fused_rmse over all keyframes):**\n")
+        agg_rows = []
+        for s in schemes_order:
+            vals = [r["fused_rmse"] for r in sim_rows if r["scheme"] == s]
+            if not vals:
+                continue
+            agg_rows.append([
+                s,
+                len(vals),
+                f"{np.mean(vals):.4f}",
+                f"{np.median(vals):.4f}",
+                f"{np.percentile(vals, 90):.4f}",
+            ])
+        md.append(md_table(
+            ["scheme", "n_kf", "mean_fused_rmse", "median", "p90"],
+            agg_rows,
+            aligns=["---"] + ["---:"] * 4,
+        ))
+
+        # Targeted: only "early-wrong" keyframes
+        ew_keys = {(r["scene"], r["frame_id_target"])
+                   for r in kf_rows
+                   if r["n_updates"] >= 5
+                   and np.isfinite(r["err_trend_late_minus_early"])
+                   and r["err_trend_late_minus_early"] < -0.05}
+        md.append("\n**Restricted to early-wrong keyframes only "
+                  f"(N={len(ew_keys)}, slope<-0.05, n_updates≥5):**\n")
+        ew_rows = []
+        for s in schemes_order:
+            vals = [r["fused_rmse"] for r in sim_rows
+                    if r["scheme"] == s and (r["scene"], r["kf"]) in ew_keys]
+            if not vals:
+                continue
+            ew_rows.append([
+                s,
+                len(vals),
+                f"{np.mean(vals):.4f}",
+                f"{np.median(vals):.4f}",
+                f"{np.percentile(vals, 90):.4f}",
+            ])
+        md.append(md_table(
+            ["scheme", "n_kf", "mean_fused_rmse", "median", "p90"],
+            ew_rows,
+            aligns=["---"] + ["---:"] * 4,
+        ))
+
+    # Existing 7f (renumbered 14)
+    md.append("\n## 14. View angle distribution (sanity check — \"tracking view angles small?\")\n")
     for role in ("tracking", "loop"):
         vs = [r["view_angle_deg"] for r in per_pair
               if r["role"] == role and np.isfinite(r["view_angle_deg"])]
