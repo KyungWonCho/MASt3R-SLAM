@@ -40,7 +40,13 @@ class FactorGraph:
 
         diag_on = diag.get().enabled
         loop_diag_on = loop_diag.get().enabled
-        need_points = diag_on or loop_diag_on
+        # Phase 3: re-fuse the symmetric decoder's pointmaps (Xji, Xij) back
+        # into the respective keyframes' canonical. The decode is already
+        # paid for the match-frac filter; these are "free" extra observations
+        # from a maximally decorrelated viewpoint.
+        loop_fuse_cfg = config["tracking"].get("loop_fuse", {})
+        loop_fuse_on = bool(loop_fuse_cfg.get("enabled", False))
+        need_points = diag_on or loop_diag_on or loop_fuse_on
         sym_out = mast3r_match_symmetric(
             self.model, feat_i, pos_i, feat_j, pos_j, shape_i, shape_j,
             return_points=need_points,
@@ -127,6 +133,36 @@ class FactorGraph:
                         match_frac_i=float(mf_i_kept[b]),
                         match_frac_j=float(mf_j_kept[b]),
                     )
+
+            # Phase 3: re-fuse the symmetric-decoded pointmaps back into each
+            # keyframe's canonical. Xji is j's pointmap in i's coord — directly
+            # compatible with keyframe_i.X_canon. We optionally gate by the
+            # SLAM-estimated baseline (skip near-zero baseline edges = consecutive
+            # KFs which already get tracking obs; loop_fuse_min_baseline_m: 0
+            # disables the gate).
+            if loop_fuse_on:
+                min_baseline = float(loop_fuse_cfg.get("min_baseline_m", 0.0))
+                exclude_consec = bool(loop_fuse_cfg.get("exclude_consecutive", False))
+                for b in range(len(kept)):
+                    if exclude_consec and consec_kept[b]:
+                        continue
+                    i_b = ii_kept[b]
+                    j_b = jj_kept[b]
+                    if min_baseline > 0:
+                        kf_i = self.frames[i_b]
+                        kf_j = self.frames[j_b]
+                        t_i = kf_i.T_WC.matrix()[0, :3, 3] if hasattr(kf_i.T_WC, "matrix") else kf_i.T_WC[:3, 3]
+                        t_j = kf_j.T_WC.matrix()[0, :3, 3] if hasattr(kf_j.T_WC, "matrix") else kf_j.T_WC[:3, 3]
+                        baseline = (t_i - t_j).norm().item()
+                        if baseline < min_baseline:
+                            continue
+                    # Fuse: shapes (H*W, 3) → (1, H*W, 3) to match update_pointmap
+                    Xji_b = Xji_kept[b].unsqueeze(0)
+                    Cji_b = Cji_kept[b].unsqueeze(0)
+                    Xij_b = Xij_kept[b].unsqueeze(0)
+                    Cij_b = Cij_kept[b].unsqueeze(0)
+                    self.frames[i_b].update_pointmap(Xji_b, Cji_b)
+                    self.frames[j_b].update_pointmap(Xij_b, Cij_b)
 
             # Per-edge lightweight loop-acceptance summary (cheap).
             # We compare each kept Xji against keyframe i's stored canonical

@@ -1,0 +1,12 @@
+inherit: "config/eval_calib_calibonly.yaml"
+
+# Phase 3: re-fuse the symmetric decode's pointmaps (Xji, Xij) into the
+# respective keyframes' canonical. Built on top of calibonly (the practical
+# winner from the prior ablation) so we can isolate the loop-fuse effect.
+tracking:
+  loop_fuse:
+    enabled: true
+    # Gate options (both default to permissive, i.e. fuse everything).
+    # min_baseline_m > 0 to skip near-zero-baseline edges (mostly consecutives).
+    min_baseline_m: 0.0
+    exclude_consecutive: false
