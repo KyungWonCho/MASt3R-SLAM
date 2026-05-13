@@ -154,39 +154,31 @@ Fusion 설계에 대한 함의: tracking에서 view_angle gate는 **불필요**.
 
 | Phase | 내용 | 상태 |
 |---|---|---|
-| 1+2 (통합) | `weighted_pointmap_calib` filtering mode: per-pixel scalar Kalman with calibrated obs-variance `σ²(c)=(a·c^p)²` + σ² floor + **Mahalanobis-gated variance inflation** | ✅ 구현됨 (`mast3r_slam/frame.py`), branch `diag/7-scenes` |
+| 1 (calibration + cap) | `weighted_pointmap_linear` filtering mode: linear weighted avg with `w_exp` (calibrated weight 지수) 및 `cap` (누적 W 상한) 옵션 | ✅ 구현됨 |
+| 2 (uncertainty / process noise) | `weighted_pointmap_kalman` filtering mode: per-pixel scalar Kalman with calibrated σ² + **process noise (forget_factor)** — 과거가 자연스럽게 잊혀짐 | ✅ 구현됨 |
 | 3 | Loop edge에서 폐기되는 X_ji 재활용 | ⏳ 미구현 |
 | 4 | Loop closure geometric verification (per-pixel pointmap residual gate 또는 3D-3D RANSAC) | ⏳ 미구현 |
 
-**Phase 1+2 코드 디테일 (proper per-pixel KF):**
+**왜 Phase 1과 2를 별도 모드로 분리했나:**
+정통 *static-state, no-Q* Kalman은 *linear weighted avg with cap* 과 **수학적으로 동치**. 그래서 KF로 짠 cap+calib는 의미적으로 새로운 게 아님. *process noise (decay)* 가 들어가야 Kalman이 진짜로 linear와 달라짐. 이 사실을 ablation에 반영하려면 calib/cap 변형은 linear 식으로 짜고, process noise만 Kalman 식 fusion 변형에 넣어야 함.
 
-`Frame` dataclass에 `sigma2` (per-pixel scalar variance) 필드 추가, 기존 `C` 는 raw 누적으로 유지 (downstream conf threshold 호환).
+**Ablation 변형 (4개):**
 
-업데이트 식 (per pixel):
-```
-σ²_obs = (a · c^p)²                                # calibrated obs variance
-K       = σ²_canon / (σ²_canon + σ²_obs)           # Kalman gain
-X_canon ← X_canon + K · (X - X_canon)
-σ²_canon ← (1 - K) · σ²_canon
-σ²_canon ← max(σ²_canon, σ²_floor)                 # prevents freeze
-```
+| variant | mode | knobs | 의미 |
+|---|---|---|---|
+| vanilla | `weighted_pointmap` | (없음) | baseline, raw c, no cap |
+| calibonly | `weighted_pointmap_linear` | `w_exp=0.74`, `cap=0` | calibration만 추가 |
+| caponly | `weighted_pointmap_linear` | `w_exp=1.0`, `cap=200` | cap만 추가 (typical c=8 ⇒ eff N≈25) |
+| calibcap | `weighted_pointmap_linear` | `w_exp=0.74`, `cap=120` | calibration + cap (cap 재scaling으로 caponly와 동일 effective N 매칭) |
+| fusion | `weighted_pointmap_kalman` | `sigma_a=0.708`, `sigma_p=-0.372`, `forget_factor=0.95` | proper KF + process noise (effective window ≈ 20) |
 
-Innovation gate (early-wrong fast correction):
-```
-mahala² = |X - X_canon|² / (σ²_canon + σ²_obs)     # ~ χ²(3) under null
-if mahala² > 9:                                    # χ²(3) 97 %ile
-    σ²_canon ←= 4                                  # less trust in prior
-```
+**왜 calibcap의 cap이 120인지:** typical c=8에서 caponly의 cap=200 ⇒ effective fusion window ≈ 200/8 = 25. 동일 effective N으로 맞추려면 calibcap의 cap = 25 · 8^0.74 ≈ 120. 안 맞추면 calibcap이 "calibration 효과"인지 "더 큰 effective N 효과"인지 구분 안 됨.
 
-**왜 `mahala² > 9` ?** 3D residual + isotropic σ² 가정 하에서 `|innov|² / σ²_combined` 가 χ² with 3 dof 따름. 9는 χ²(3)의 97 %ile — "노이즈 모델이 맞다면 가장 surprising한 3% 관측" 에서 gate fire. 임의 휴리스틱이 아니라 **통계적으로 정당화되는** false positive rate 제어.
+**Process noise (`forget_factor`)의 의미:**
+매 step 전에 `σ²_canon ← σ²_canon / λ` (λ < 1) 적용. prior의 certainty가 자라지 못함 → 오래된 obs는 자연스럽게 가중치 ↓. λ=0.95 ⇒ effective window ≈ 1/(1−λ) = 20. **이것이 user 의도한 "uncertainty가 update에 영향" 메커니즘** — disagree 감지 후 inflate하는 reset과 달리, *항상* 부드럽게 옛 obs를 잊는 EWMA-style 동작. 별도 threshold 없음.
 
-**config 섹션 `tracking.fusion`** — 5개 노브:
-- `sigma_a = 0.708`, `sigma_p = -0.372` : §2 cross-scene fit
-- `sigma2_floor = 5e-3` : effective N ≈ σ²_obs / σ²_floor ≈ 20 정도
-- `mahala2_thresh = 9.0` : χ²(3) 97 %ile
-- `inflation = 4.0` : gate fire 시 σ² 배수
-
-**기존 `weighted_pointmap` 그대로** 두고 새 mode 추가 → A/B 비교 가능.
+**왜 reset (Mahalanobis gate) 안 넣었나:**
+이전 commit (`002e306`) 에선 reset이 있었으나 — process noise가 "과거가 *자연스럽게* 잊혀지는" 메커니즘을 이미 제공하니까 reset은 over-engineering. 결과 보고 정말 필요하면 orthogonal knob로 추가 가능.
 
 **평가 중 (서버, 4-GPU 병렬):**
 - vanilla (`config/eval_calib.yaml`) vs fusion (`config/eval_calib_fusion.yaml`) on 7-Scenes 전 scene
