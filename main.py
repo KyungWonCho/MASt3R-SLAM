@@ -69,9 +69,6 @@ def relocalization(frame, keyframes, factor_graph, retrieval_database):
                 factor_graph.solve_GN_calib()
             else:
                 factor_graph.solve_GN_rays()
-            # Phase 3: now that poses have been refined, fuse any pending
-            # loop-closure pointmaps whose KFs have ≥ 1 opt pass.
-            factor_graph.apply_pending_loop_fusions()
         return successful_loop_closure
 
 
@@ -153,10 +150,6 @@ def run_backend(cfg, model, states, keyframes, K):
             factor_graph.solve_GN_calib()
         else:
             factor_graph.solve_GN_rays()
-
-        # Phase 3: drain pending loop-pointmap fusions for KFs whose poses
-        # have now been refined by at least one backend opt pass.
-        factor_graph.apply_pending_loop_fusions()
 
         with states.lock:
             if len(states.global_optimizer_tasks) > 0:

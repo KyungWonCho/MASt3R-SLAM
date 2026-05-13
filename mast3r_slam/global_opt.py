@@ -7,6 +7,7 @@ from mast3r_slam.geometry import (
 )
 from mast3r_slam.mast3r_utils import mast3r_match_symmetric
 from mast3r_slam import diag, loop_diag
+from mast3r_slam.tracker import FrameTracker
 import mast3r_slam_backends
 
 
@@ -28,11 +29,12 @@ class FactorGraph:
 
         self.K = K
 
-        # Phase 3: deferred loop-pointmap fusion. Each entry holds the
-        # symmetric-decode pointmaps that will be re-fused into the two
-        # keyframes' canonical, *after* both have been touched by at least one
-        # backend optimisation pass.
-        self.pending_loop_fusions = []
+        # Phase 3 uses the same GN pose solver the tracker uses for
+        # frame ↔ keyframe — only applied to keyframe ↔ keyframe pairs at
+        # loop-closure time, so the relative pose comes from the matched
+        # MASt3R correspondences themselves rather than from the global
+        # T_WC poses (which may be drifted).
+        self._loop_solver = FrameTracker(model, frames, device)
 
     def add_factors(self, ii, jj, min_match_frac, is_reloc=False):
         kf_ii = [self.frames[idx] for idx in ii]
@@ -60,7 +62,8 @@ class FactorGraph:
         if need_points:
             (idx_i2j, idx_j2i, valid_match_j, valid_match_i,
              Qii, Qjj, Qji, Qij,
-             Xji_full, Cji_full, Xij_full, Cij_full) = sym_out
+             Xji_full, Cji_full, Xij_full, Cij_full,
+             Xii_full, Cii_full, Xjj_full, Cjj_full) = sym_out
         else:
             (idx_i2j, idx_j2i, valid_match_j, valid_match_i,
              Qii, Qjj, Qji, Qij) = sym_out
@@ -140,28 +143,70 @@ class FactorGraph:
                         match_frac_j=float(mf_j_kept[b]),
                     )
 
-            # Phase 3: enqueue loop-pointmap fusion. The symmetric decode gives
-            #   Xij : i-grid, j-coord  → into kf_i (needs T_{i←j} transform)
-            #   Xji : j-grid, i-coord  → into kf_j (needs T_{j←i} transform)
-            # The transforms use SLAM-estimated keyframe poses, which are
-            # *drifted* on freshly added keyframes. We defer the fusion until
-            # both keyframes have had at least one backend opt pass — see
-            # FactorGraph.apply_pending_loop_fusions().
+            # Phase 3: fuse the symmetric decoder's cross-view pointmaps back
+            # into the respective keyframes' canonical, using a fresh local
+            # GN solve (the same one tracker uses for frame ↔ keyframe) to
+            # get the i ↔ j relative Sim3. This makes the transform consistent
+            # with MASt3R's own view of the pair, independent of global T_WC
+            # drift.
+            #
+            # Treating j as "frame" and i as "keyframe" in tracker terms:
+            #   Xf = Xjj   (j-grid in j-coord)        ↔ tracker's frame.X_canon
+            #   Xk = Xji   (j-grid in i-coord)        ↔ tracker's keyframe.X_canon
+            #   Q  = sqrt(Cji · Cjj)                  (joint conf at j-pixels)
+            # opt_pose_ray_dist_sim3 returns T_WCf and T_CkCf where T_CkCf is
+            # the i-from-j transform we need to bring Xij (i-grid in j-coord)
+            # back to i-coord.
             if loop_fuse_on:
+                Xii_kept = Xii_full[valid_edges]
+                Cii_kept = Cii_full[valid_edges]
+                Xjj_kept = Xjj_full[valid_edges]
+                Cjj_kept = Cjj_full[valid_edges]
                 exclude_consec = bool(loop_fuse_cfg.get("exclude_consecutive", False))
                 for b in range(len(kept)):
                     if exclude_consec and consec_kept[b]:
                         continue
-                    self.pending_loop_fusions.append({
-                        "i": int(ii_kept[b]),
-                        "j": int(jj_kept[b]),
-                        # detach + clone so the tensors persist past this
-                        # add_factors call's GPU memory churn.
-                        "Xij": Xij_kept[b].detach().clone(),
-                        "Cij": Cij_kept[b].detach().clone(),
-                        "Xji": Xji_kept[b].detach().clone(),
-                        "Cji": Cji_kept[b].detach().clone(),
-                    })
+                    i_b = int(ii_kept[b])
+                    j_b = int(jj_kept[b])
+                    kf_i = self.frames[i_b]
+                    kf_j = self.frames[j_b]
+
+                    # Local solve for T_{i ← j} (= T_CkCf with k=i, f=j).
+                    Qj_b = (Cji_kept[b] * Cjj_kept[b]).clamp(min=0).sqrt()
+                    vmj_b = vmj_kept[b]
+                    try:
+                        _, T_i_from_j = self._loop_solver.opt_pose_ray_dist_sim3(
+                            Xjj_kept[b], Xji_kept[b],
+                            kf_j.T_WC, kf_i.T_WC,
+                            Qj_b, vmj_b,
+                        )
+                    except Exception as e:
+                        # Numerical failure on a single edge: just skip it.
+                        print(f"[loop_fuse] skip edge ({i_b},{j_b}) i-side: {e}")
+                        T_i_from_j = None
+
+                    # Local solve for T_{j ← i}.
+                    Qi_b = (Cij_kept[b] * Cii_kept[b]).clamp(min=0).sqrt()
+                    vmi_b = vmi_kept[b]
+                    try:
+                        _, T_j_from_i = self._loop_solver.opt_pose_ray_dist_sim3(
+                            Xii_kept[b], Xij_kept[b],
+                            kf_i.T_WC, kf_j.T_WC,
+                            Qi_b, vmi_b,
+                        )
+                    except Exception as e:
+                        print(f"[loop_fuse] skip edge ({i_b},{j_b}) j-side: {e}")
+                        T_j_from_i = None
+
+                    # Fuse + write back.
+                    if T_i_from_j is not None:
+                        Xij_in_i = T_i_from_j.act(Xij_kept[b])
+                        kf_i.update_pointmap(Xij_in_i, Cij_kept[b])
+                        self.frames[i_b] = kf_i
+                    if T_j_from_i is not None:
+                        Xji_in_j = T_j_from_i.act(Xji_kept[b])
+                        kf_j.update_pointmap(Xji_in_j, Cji_kept[b])
+                        self.frames[j_b] = kf_j
 
             # Per-edge lightweight loop-acceptance summary (cheap).
             # We compare each kept Xji against keyframe i's stored canonical
@@ -194,48 +239,6 @@ class FactorGraph:
 
         added_new_edges = valid_edges.sum() > 0
         return added_new_edges
-
-    def apply_pending_loop_fusions(self):
-        """Phase 3: drain the pending-fusion queue for edges where both
-        keyframes have been refined by at least one backend opt pass.
-
-        The symmetric-decode pointmaps come from the decoder in different
-        coordinate frames than the destination keyframe's canonical:
-            Xij is in j's coord  → transform to i's coord  → fuse into kf_i
-            Xji is in i's coord  → transform to j's coord  → fuse into kf_j
-        The Sim3 transform uses the keyframes' SLAM-estimated poses, so we
-        only do this after both have been optimised at least once.
-        """
-        if not self.pending_loop_fusions:
-            return
-        remaining = []
-        for entry in self.pending_loop_fusions:
-            i, j = entry["i"], entry["j"]
-            # Gate on shared storage so we see the real refined-pose counter,
-            # not the temp Frame copy that __getitem__ would hand back.
-            if (int(self.frames.n_opt_passes[i]) < 1
-                    or int(self.frames.n_opt_passes[j]) < 1):
-                remaining.append(entry)
-                continue
-            kf_i = self.frames[i]
-            kf_j = self.frames[j]
-            # T_{i ← j} = T_WCi^-1 · T_WCj  (matches tracker.py:T_CkCf idiom)
-            T_i_from_j = kf_i.T_WC.inv() * kf_j.T_WC
-            T_j_from_i = kf_j.T_WC.inv() * kf_i.T_WC
-            # lietorch.Sim3.act broadcasts T (shape (1,)) over points whose
-            # leading dims have matching rank — keep points as (H*W, 3),
-            # matching how SharedKeyframes stores X_canon.
-            Xij_in_i = T_i_from_j.act(entry["Xij"])
-            Xji_in_j = T_j_from_i.act(entry["Xji"])
-            kf_i.update_pointmap(Xij_in_i, entry["Cij"])
-            kf_j.update_pointmap(Xji_in_j, entry["Cji"])
-            # Write back to shared storage — update_pointmap mutates the temp
-            # Frame's X_canon/C; without write-back the fusion is silently a
-            # no-op (this is exactly why our previous run came out bitwise
-            # identical to calibonly).
-            self.frames[i] = kf_i
-            self.frames[j] = kf_j
-        self.pending_loop_fusions = remaining
 
     def get_unique_kf_idx(self):
         return torch.unique(torch.cat([self.ii, self.jj]), sorted=True)
@@ -296,11 +299,6 @@ class FactorGraph:
         # Update the keyframe T_WC
         self.frames.update_T_WCs(T_WCs[pin:], unique_kf_idx[pin:])
 
-        # Mark touched keyframes (write directly to shared storage — going
-        # through self.frames[idx] returns a temp Frame copy, increments on
-        # that copy would not persist).
-        for idx in unique_kf_idx.cpu().tolist():
-            self.frames.n_opt_passes[idx] += 1
 
     def solve_GN_calib(self):
         K = self.K
@@ -357,8 +355,3 @@ class FactorGraph:
         # Update the keyframe T_WC
         self.frames.update_T_WCs(T_WCs[pin:], unique_kf_idx[pin:])
 
-        # Mark touched keyframes (write directly to shared storage — going
-        # through self.frames[idx] returns a temp Frame copy, increments on
-        # that copy would not persist).
-        for idx in unique_kf_idx.cpu().tolist():
-            self.frames.n_opt_passes[idx] += 1

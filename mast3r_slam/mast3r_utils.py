@@ -181,11 +181,18 @@ def mast3r_match_symmetric(model, feat_i, pos_i, feat_j, pos_j, shape_i, shape_j
         Qij.view(b, -1, 1),
     ]
     if return_points:
-        # Per-edge per-pixel pointmaps and pointmap-confs, flattened to (b, H*W, c)
+        # Per-edge per-pixel pointmaps and pointmap-confs, flattened to (b, H*W, c).
+        # Order: cross-view first (the ones we fuse), then self-view (used to
+        # solve the MASt3R-internal i↔j relative Sim3 via Umeyama at the loop
+        # closure call site — decoupled from global pose drift).
         out.append(Xji.reshape(b, -1, 3))
         out.append(Cji.reshape(b, -1, 1))
         out.append(Xij.reshape(b, -1, 3))
         out.append(Cij.reshape(b, -1, 1))
+        out.append(Xii.reshape(b, -1, 3))
+        out.append(Cii.reshape(b, -1, 1))
+        out.append(Xjj.reshape(b, -1, 3))
+        out.append(Cjj.reshape(b, -1, 1))
     return tuple(out)
 
 
