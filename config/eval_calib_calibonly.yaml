@@ -1,12 +1,9 @@
 inherit: "config/eval_calib.yaml"
 
-# Ablation: calibration only (no cap, no innovation gate).
-# Tests whether the calibrated weight exponent alone moves ATE/geometry.
+# Ablation: calibration only (linear weighted avg, c^0.74 weight, no cap).
+# Isolates the effect of the calibrated weight exponent vs vanilla's raw c.
 tracking:
-  filtering_mode: weighted_pointmap_calib
+  filtering_mode: weighted_pointmap_linear
   fusion:
-    sigma_a: 0.708
-    sigma_p: -0.372       # calibrated
-    sigma2_floor: 1.0e-10 # effectively disabled (no cap)
-    mahala2_thresh: 0     # disabled
-    inflation: 1.0
+    w_exp: 0.74   # calibrated from cross-scene σ ≈ a·c^p, p ≈ -0.37
+    cap: 0        # 0 = no cap (matches vanilla's unbounded accumulator)

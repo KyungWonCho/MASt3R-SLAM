@@ -1,14 +1,12 @@
 inherit: "config/eval_calib.yaml"
 
-# Ablation: calibration + cap (no innovation gate).
-# Isolates the innovation-gate contribution from the rest. If `fusion`
-# beats this but this matches vanilla, the innovation gate carries
-# the win. If this already beats vanilla, calibration+cap is enough.
+# Ablation: calibration + cap (linear weighted avg, c^0.74 weight, with cap).
+# Cap scaled to match the same effective fusion window as `caponly` (≈ 25 obs):
+#   typical c ≈ 8  ⇒  typical c^0.74 ≈ 4.7  ⇒  cap ≈ 25 · 4.7 ≈ 120
+# without this scaling, calibcap would silently have a larger effective N
+# than caponly (cap=200/4.7 ≈ 42) and the ablation would conflate two effects.
 tracking:
-  filtering_mode: weighted_pointmap_calib
+  filtering_mode: weighted_pointmap_linear
   fusion:
-    sigma_a: 0.708
-    sigma_p: -0.372       # calibrated
-    sigma2_floor: 5.0e-3  # cap on σ²
-    mahala2_thresh: 0     # disabled
-    inflation: 1.0
+    w_exp: 0.74
+    cap: 120.0    # ≈ same effective N≈25 as caponly's cap=200

@@ -1,13 +1,9 @@
 inherit: "config/eval_calib.yaml"
 
-# Ablation: cap only (raw c weight, no calibration, no innovation gate).
-# Tests whether freeze prevention alone helps, holding the weight exponent
-# at the current code's implicit assumption (σ² ∝ 1/c ⇔ weight ∝ c).
+# Ablation: cap only (linear weighted avg, raw c weight, with cap).
+# Isolates the effect of freeze prevention vs vanilla's unbounded accumulator.
 tracking:
-  filtering_mode: weighted_pointmap_calib
+  filtering_mode: weighted_pointmap_linear
   fusion:
-    sigma_a: 1.0          # arbitrary positive — only ratios matter for K
-    sigma_p: -0.5         # σ²(c) ∝ 1/c ⇔ weight ∝ c (matches current code)
-    sigma2_floor: 5.0e-3  # cap on σ² (≈ effective N ~25)
-    mahala2_thresh: 0     # disabled
-    inflation: 1.0
+    w_exp: 1.0     # raw c (same as vanilla)
+    cap: 200.0     # typical c ≈ 8 ⇒ effective fusion window ≈ 25 obs

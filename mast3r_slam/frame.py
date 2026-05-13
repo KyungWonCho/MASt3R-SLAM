@@ -24,11 +24,17 @@ class Frame:
     T_WC: lietorch.Sim3 = lietorch.Sim3.Identity(1)
     X_canon: Optional[torch.Tensor] = None
     C: Optional[torch.Tensor] = None
-    # Per-pixel scalar variance estimate for filtering_mode=="weighted_pointmap_calib".
-    # Initialised from the calibrated obs variance on first call into that branch,
-    # then propagated via proper scalar Kalman updates (with Mahalanobis innovation
-    # gating). Kept separate from C so downstream conf thresholds (which expect raw
-    # c) stay backwards compatible. sigma2 shape == C shape (per pixel, scalar).
+    # Per-pixel accumulated *calibrated* weight (Σ c^w_exp), used by
+    # filtering_mode == "weighted_pointmap_linear". Stored separately from C
+    # so downstream conf thresholds (which expect raw c) stay compatible.
+    W: Optional[torch.Tensor] = None
+    # Per-pixel scalar variance, used by filtering_mode == "weighted_pointmap_kalman".
+    # Updated via standard scalar Kalman + process-noise inflation (1/forget_factor)
+    # per step. The process noise is what makes the Kalman variant genuinely
+    # different from the linear (cap+calib) form: old observations are naturally
+    # discounted over time, so an incorrect early prior fades on its own as new
+    # observations come in. Pure KF without process noise (Q=0) reduces to the
+    # linear weighted average — proven mathematically.
     sigma2: Optional[torch.Tensor] = None
     feat: Optional[torch.Tensor] = None
     pos: Optional[torch.Tensor] = None
@@ -81,66 +87,85 @@ class Frame:
             self.X_canon = ((self.C * self.X_canon) + (C * X)) / (self.C + C)
             self.C = self.C + C
             self.N += 1
-        elif filtering_mode == "weighted_pointmap_calib":
-            # Per-pixel scalar Kalman fusion with calibrated obs-variance model
-            # and Mahalanobis-gated variance inflation. Derived from the 7-Scenes
-            # diag finding σ ∝ a · c^p with cross-scene a ≈ 0.708, p ≈ -0.37.
+        elif filtering_mode == "weighted_pointmap_linear":
+            # Vanilla linear weighted average with two optional knobs:
+            #   w_exp: weight exponent (1.0 = raw c = vanilla; 0.74 ≈ calibrated)
+            #   cap:   ceiling on accumulated weight (>0 enables; 0 = no cap)
+            # No σ² tracking. Used for the calibonly / caponly / calibcap
+            # ablations, which deliberately stay in vanilla's framework and
+            # only change the weight formula and/or cap.
             #
-            #   σ²_obs(c) = (a · c^p)²        per-pixel obs variance (scalar)
-            #   K         = σ²_canon / (σ²_canon + σ²_obs)
-            #   X_canon  ← X_canon + K (X - X_canon)
-            #   σ²_canon ← (1 - K) σ²_canon
+            # IMPORTANT: cap should be set to keep the effective fusion window
+            # (≈ cap / typical w) comparable across ablations. With raw c
+            # (typical 8) cap=200 → eff N≈25. With c^0.74 (typical 4.7) the
+            # equivalent eff N is at cap ≈ 120.
+            fcfg = config["tracking"].get("fusion", {})
+            w_exp = fcfg.get("w_exp", 1.0)
+            cap = fcfg.get("cap", 0.0)  # <=0 disables cap
+
+            if w_exp == 1.0:
+                w_new = C
+            else:
+                w_new = C.clamp(min=1e-6) ** w_exp
+
+            # First call: convert self.C (raw, from N==0 init) to the calibrated
+            # accumulator W. After this, fusion math uses W; downstream conf
+            # threshold checks still see the (still-accumulating) raw C below.
+            if self.W is None:
+                if w_exp == 1.0:
+                    self.W = self.C.clone()
+                else:
+                    self.W = self.C.clamp(min=1e-6) ** w_exp
+                if cap > 0:
+                    self.W = self.W.clamp(max=cap)
+
+            denom = self.W + w_new
+            self.X_canon = (self.W * self.X_canon + w_new * X) / denom
+            self.W = self.W + w_new
+            if cap > 0:
+                self.W = self.W.clamp(max=cap)
+            self.C = self.C + C  # raw, for downstream conf-threshold compat
+            self.N += 1
+        elif filtering_mode == "weighted_pointmap_kalman":
+            # Per-pixel scalar Kalman with calibrated obs variance AND process
+            # noise. The process noise (decay) is what genuinely separates this
+            # from the linear (cap+calib) form: every step we inflate σ²_canon
+            # by 1/λ before the Kalman update, so the prior naturally loses
+            # certainty over time. Old (possibly wrong) priors fade on their
+            # own as new observations come in.
             #
-            # Innovation gating uses chi²-distributed |innov|² / (3 σ²_combined)
-            # (isotropic scalar variance, 3D residual ⇒ chi² with 3 dof). When
-            # the test exceeds mahala2_thresh, σ²_canon is multiplied by
-            # `inflation` *before* the Kalman update, so the new obs immediately
-            # gets a larger gain — that's the "early-wrong fast correction"
-            # mechanism the cap-only design couldn't provide.
+            #   σ²_obs(c)  = (a · c^p)²
+            #   σ²_canon  ← σ²_canon / λ                (process noise / decay)
+            #   K          = σ²_canon / (σ²_canon + σ²_obs)
+            #   X_canon   ← X_canon + K (X − X_canon)
+            #   σ²_canon  ← (1 − K) σ²_canon
             #
-            # Floor on σ²_canon prevents unbounded shrinkage (= freeze).
-            #
-            # Knobs (under config tracking.fusion):
-            #   sigma_a, sigma_p   calibrated noise model
-            #   sigma2_floor       lower bound on σ²_canon (≈ 1/cap in W-form)
-            #   mahala2_thresh     chi²(3) gate: 9 ≈ 97th percentile
-            #   inflation          multiplier on σ²_canon when gate fires
+            # λ = forget_factor < 1.  λ=0.95 ⇒ effective window ≈ 1/(1−λ) = 20.
+            # Without decay (λ=1) the update is mathematically identical to
+            # linear weighted-avg with calibrated weight + floor — that's the
+            # static-state-no-Q ⇔ inverse-variance MLE equivalence. So decay
+            # is the *only* mechanism here that lets Kalman beat linear.
             fcfg = config["tracking"].get("fusion", {})
             sigma_a = fcfg.get("sigma_a", 0.708)
             sigma_p = fcfg.get("sigma_p", -0.372)
-            sigma2_floor = fcfg.get("sigma2_floor", 5e-3)
-            mahala2_thresh = fcfg.get("mahala2_thresh", 9.0)
-            inflation = fcfg.get("inflation", 4.0)
+            forget = fcfg.get("forget_factor", 0.95)
+            sigma2_floor = fcfg.get("sigma2_floor", 0.0)
 
             c_safe = C.clamp(min=1e-6)
             sigma2_obs = (sigma_a * c_safe ** sigma_p) ** 2
 
-            # First call into this branch: initialise σ²_canon from the calibrated
-            # obs-variance of the very first observation (the X_canon itself was
-            # set to that obs in the N==0 init block).
             if self.sigma2 is None:
                 self.sigma2 = sigma2_obs.clone()
 
-            # Mahalanobis innovation gate. Under the null hypothesis (obs really
-            # drawn from N(X_canon, σ²_combined · I)), |innov|² / σ²_combined
-            # follows χ² with 3 dof. mahala2_thresh = 9 ≈ 97th percentile, so
-            # we gate on the rarest 3 % of innovations *under the noise model*.
-            if mahala2_thresh > 0:
-                innov2 = ((X - self.X_canon) ** 2).sum(dim=-1, keepdim=True)
-                mahala2 = innov2 / (self.sigma2 + sigma2_obs)
-                gate = (mahala2 > mahala2_thresh).to(self.sigma2.dtype)
-                # Inflate σ²_canon at gated pixels: less trust in prior ⇒
-                # next Kalman gain larger ⇒ fast correction of early-wrong.
-                self.sigma2 = self.sigma2 * (1.0 + gate * (inflation - 1.0))
+            # Process noise (decay) — the actual "uncertainty" mechanism.
+            if forget < 1.0:
+                self.sigma2 = self.sigma2 / forget
 
-            # Standard scalar Kalman update (per pixel, scalar variance)
             K = self.sigma2 / (self.sigma2 + sigma2_obs)
             self.X_canon = self.X_canon + K * (X - self.X_canon)
             self.sigma2 = (1.0 - K) * self.sigma2
-            # Floor prevents excessive certainty (= freeze). Acts like the cap on
-            # accumulated W in the linear-form derivation.
-            self.sigma2 = self.sigma2.clamp(min=sigma2_floor)
-            # Keep raw conf accumulator for downstream threshold compat.
+            if sigma2_floor > 0:
+                self.sigma2 = self.sigma2.clamp(min=sigma2_floor)
             self.C = self.C + C
             self.N += 1
         elif filtering_mode == "weighted_spherical":

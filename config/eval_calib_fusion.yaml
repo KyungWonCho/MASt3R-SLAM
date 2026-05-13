@@ -1,15 +1,14 @@
 inherit: "config/eval_calib.yaml"
 
-# Per-pixel scalar Kalman fusion with calibrated noise model and
-# Mahalanobis-gated variance inflation. See notes/diag_findings.md.
+# Phase 1+2: per-pixel Kalman with calibrated obs variance + process noise.
+# The process noise (forget_factor < 1) is what makes this genuinely
+# different from the linear cap+calib form — it actively decays the prior's
+# certainty each step, letting old (possibly wrong) observations fade
+# naturally without any explicit reset / threshold tuning.
 tracking:
-  filtering_mode: weighted_pointmap_calib
+  filtering_mode: weighted_pointmap_kalman
   fusion:
-    sigma_a: 0.708        # calibrated from cross-scene σ ≈ a · c^p (§2)
-    sigma_p: -0.372       # cross-scene fit (3243 pairs, 552M pixel obs)
-    sigma2_floor: 5e-3    # lower bound on σ²_canon; prevents freeze
-                          # (≈ effective N cap of ~20 for typical c)
-    mahala2_thresh: 9.0   # χ²(3) 97 %ile — gate fires on the rarest 3 % of innov
-                          # under the noise model
-    inflation: 4.0        # σ²_canon ×= 4 when gate fires ⇒ next Kalman gain
-                          # ≈ 4× larger ⇒ "fast correction of early-wrong"
+    sigma_a: 0.708         # cross-scene σ ≈ a · c^p fit
+    sigma_p: -0.372        # cross-scene σ ≈ a · c^p fit
+    forget_factor: 0.95    # λ; σ² ← σ²/λ per step. effective window ≈ 1/(1−λ) = 20
+    sigma2_floor: 0.0      # optional; usually unnecessary with forget_factor < 1

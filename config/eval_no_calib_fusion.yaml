@@ -1,10 +1,9 @@
 inherit: "config/eval_no_calib.yaml"
 
 tracking:
-  filtering_mode: weighted_pointmap_calib
+  filtering_mode: weighted_pointmap_kalman
   fusion:
     sigma_a: 0.708
     sigma_p: -0.372
-    sigma2_floor: 5e-3
-    mahala2_thresh: 9.0
-    inflation: 4.0
+    forget_factor: 0.95
+    sigma2_floor: 0.0
