@@ -211,11 +211,14 @@ class FactorGraph:
         remaining = []
         for entry in self.pending_loop_fusions:
             i, j = entry["i"], entry["j"]
-            kf_i = self.frames[i]
-            kf_j = self.frames[j]
-            if kf_i.n_opt_passes < 1 or kf_j.n_opt_passes < 1:
+            # Gate on shared storage so we see the real refined-pose counter,
+            # not the temp Frame copy that __getitem__ would hand back.
+            if (int(self.frames.n_opt_passes[i]) < 1
+                    or int(self.frames.n_opt_passes[j]) < 1):
                 remaining.append(entry)
                 continue
+            kf_i = self.frames[i]
+            kf_j = self.frames[j]
             # T_{i ← j} = T_WCi^-1 · T_WCj  (matches tracker.py:T_CkCf idiom)
             T_i_from_j = kf_i.T_WC.inv() * kf_j.T_WC
             T_j_from_i = kf_j.T_WC.inv() * kf_i.T_WC
@@ -228,6 +231,12 @@ class FactorGraph:
             Xji_in_j = T_j_from_i.act(Xji_b)
             kf_i.update_pointmap(Xij_in_i, Cij_b)
             kf_j.update_pointmap(Xji_in_j, Cji_b)
+            # Write back to shared storage — update_pointmap mutates the temp
+            # Frame's X_canon/C; without write-back the fusion is silently a
+            # no-op (this is exactly why our previous run came out bitwise
+            # identical to calibonly).
+            self.frames[i] = kf_i
+            self.frames[j] = kf_j
         self.pending_loop_fusions = remaining
 
     def get_unique_kf_idx(self):
@@ -289,9 +298,11 @@ class FactorGraph:
         # Update the keyframe T_WC
         self.frames.update_T_WCs(T_WCs[pin:], unique_kf_idx[pin:])
 
-        # Mark touched keyframes so Phase 3 fusion can use their refined pose.
+        # Mark touched keyframes (write directly to shared storage — going
+        # through self.frames[idx] returns a temp Frame copy, increments on
+        # that copy would not persist).
         for idx in unique_kf_idx.cpu().tolist():
-            self.frames[idx].n_opt_passes += 1
+            self.frames.n_opt_passes[idx] += 1
 
     def solve_GN_calib(self):
         K = self.K
@@ -348,6 +359,8 @@ class FactorGraph:
         # Update the keyframe T_WC
         self.frames.update_T_WCs(T_WCs[pin:], unique_kf_idx[pin:])
 
-        # Mark touched keyframes so Phase 3 fusion can use their refined pose.
+        # Mark touched keyframes (write directly to shared storage — going
+        # through self.frames[idx] returns a temp Frame copy, increments on
+        # that copy would not persist).
         for idx in unique_kf_idx.cpu().tolist():
-            self.frames[idx].n_opt_passes += 1
+            self.frames.n_opt_passes[idx] += 1

@@ -340,6 +340,7 @@ class SharedKeyframes:
         self.C = torch.zeros(buffer, h * w, 1, device=device, dtype=dtype).share_memory_()
         self.N = torch.zeros(buffer, device=device, dtype=torch.int).share_memory_()
         self.N_updates = torch.zeros(buffer, device=device, dtype=torch.int).share_memory_()
+        self.n_opt_passes = torch.zeros(buffer, device=device, dtype=torch.int).share_memory_()
         self.feat = torch.zeros(buffer, 1, self.num_patches, self.feat_dim, device=device, dtype=dtype).share_memory_()
         self.pos = torch.zeros(buffer, 1, self.num_patches, 2, device=device, dtype=torch.long).share_memory_()
         self.is_dirty = torch.zeros(buffer, 1, device=device, dtype=torch.bool).share_memory_()
@@ -363,6 +364,7 @@ class SharedKeyframes:
             kf.pos = self.pos[idx]
             kf.N = int(self.N[idx])
             kf.N_updates = int(self.N_updates[idx])
+            kf.n_opt_passes = int(self.n_opt_passes[idx])
             if config["use_calib"]:
                 kf.K = self.K
             return kf
@@ -384,6 +386,7 @@ class SharedKeyframes:
             self.pos[idx] = value.pos
             self.N[idx] = value.N
             self.N_updates[idx] = value.N_updates
+            self.n_opt_passes[idx] = value.n_opt_passes
             self.is_dirty[idx] = True
             return idx
 
