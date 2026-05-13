@@ -222,15 +222,13 @@ class FactorGraph:
             # T_{i ← j} = T_WCi^-1 · T_WCj  (matches tracker.py:T_CkCf idiom)
             T_i_from_j = kf_i.T_WC.inv() * kf_j.T_WC
             T_j_from_i = kf_j.T_WC.inv() * kf_i.T_WC
-            # (H*W, 3) → (1, H*W, 3) for batched .act
-            Xij_b = entry["Xij"].unsqueeze(0)
-            Cij_b = entry["Cij"].unsqueeze(0)
-            Xji_b = entry["Xji"].unsqueeze(0)
-            Cji_b = entry["Cji"].unsqueeze(0)
-            Xij_in_i = T_i_from_j.act(Xij_b)
-            Xji_in_j = T_j_from_i.act(Xji_b)
-            kf_i.update_pointmap(Xij_in_i, Cij_b)
-            kf_j.update_pointmap(Xji_in_j, Cji_b)
+            # lietorch.Sim3.act broadcasts T (shape (1,)) over points whose
+            # leading dims have matching rank — keep points as (H*W, 3),
+            # matching how SharedKeyframes stores X_canon.
+            Xij_in_i = T_i_from_j.act(entry["Xij"])
+            Xji_in_j = T_j_from_i.act(entry["Xji"])
+            kf_i.update_pointmap(Xij_in_i, entry["Cij"])
+            kf_j.update_pointmap(Xji_in_j, entry["Cji"])
             # Write back to shared storage — update_pointmap mutates the temp
             # Frame's X_canon/C; without write-back the fusion is silently a
             # no-op (this is exactly why our previous run came out bitwise
