@@ -66,8 +66,9 @@ def color_for(name):
 
 
 def load_pred(scene, variant, logs_root, scene_dir):
-    """Returns dict with sim3-aligned pred trajectory + pointcloud, or None
-    if any required file is missing.
+    """Returns dict with sim3-aligned pred trajectory + pointcloud, plus the
+    matched (pred, GT) pairs used by ATE so we can color by per-frame error.
+    None if any required file is missing.
     """
     base = logs_root / "7-scenes" / variant / "calib" / scene
     est_ply = base / f"{scene}.ply"
@@ -80,9 +81,19 @@ def load_pred(scene, variant, logs_root, scene_dir):
     s, R, t, src_aligned, dst_aligned = align_traj(est_ts, est_pos, gt_ts, gt_pos)
     pred_pts_aligned = apply_sim3(pred_pts, s, R, t)
     pred_pos_aligned = apply_sim3(est_pos, s, R, t)
+    # The matched pairs used by ATE — same frames where pred (after Sim3) and
+    # GT timestamps agree. Per-frame error = || pred_after_sim3 - gt ||.
+    pred_matched = apply_sim3(src_aligned, s, R, t).astype(np.float32)
+    gt_matched = dst_aligned.astype(np.float32)
+    per_frame_err = np.linalg.norm(pred_matched - gt_matched, axis=1)
+    ate_rmse = float(np.sqrt((per_frame_err ** 2).mean()))
     return {
         "pred_pts": pred_pts_aligned.astype(np.float32),
         "pred_traj": pred_pos_aligned.astype(np.float32),
+        "pred_matched": pred_matched,
+        "gt_matched": gt_matched,
+        "per_frame_err": per_frame_err.astype(np.float32),
+        "ate_rmse": ate_rmse,
         "scale": float(s),
     }
 
@@ -168,6 +179,11 @@ def main():
     with server.gui.add_folder("Render"):
         point_size = server.gui.add_slider("point size", 0.001, 0.05, 0.001, 0.005)
         traj_width = server.gui.add_slider("traj width", 1.0, 12.0, 0.5, 4.0)
+        error_view = server.gui.add_checkbox("color pred traj by error", initial_value=False)
+        show_err_vecs = server.gui.add_checkbox("show error vectors (pred↔GT)", initial_value=False)
+        err_clip = server.gui.add_slider("error colormap cap (m)", 0.005, 0.5, 0.005, 0.05)
+
+    stats_md = server.gui.add_markdown("(no variant loaded yet)")
 
     # Track scene-graph handles so we can remove on update
     handles = []
@@ -239,18 +255,95 @@ def main():
                 ))
 
             if show_pred_traj.value and data["pred_traj"].shape[0] >= 2:
-                handles.append(server.scene.add_spline_catmull_rom(
-                    f"/pred_traj_{v}_{scene}",
-                    positions=data["pred_traj"],
-                    color=col,
-                    line_width=traj_width.value,
-                ))
+                if error_view.value and data["pred_matched"].size:
+                    # Render the matched pred points colored by per-frame error
+                    # (red = ≥ cap, green = 0). This is what ATE actually
+                    # measures, so it's where the metric's mass lives.
+                    e = data["per_frame_err"]
+                    cap = max(err_clip.value, 1e-6)
+                    t01 = np.clip(e / cap, 0.0, 1.0)
+                    colors = np.stack([
+                        (255 * t01).astype(np.uint8),
+                        (255 * (1.0 - t01)).astype(np.uint8),
+                        np.zeros_like(t01, dtype=np.uint8),
+                    ], axis=1)
+                    handles.append(server.scene.add_point_cloud(
+                        f"/pred_err_{v}_{scene}",
+                        points=data["pred_matched"],
+                        colors=colors,
+                        point_size=max(point_size.value * 3, 0.01),
+                    ))
+                else:
+                    handles.append(server.scene.add_spline_catmull_rom(
+                        f"/pred_traj_{v}_{scene}",
+                        positions=data["pred_traj"],
+                        color=col,
+                        line_width=traj_width.value,
+                    ))
+
+            # Error vectors — small line segments from each matched pred to its
+            # GT counterpart. Reveals if ATE is dominated by a few outliers vs.
+            # a uniform offset.
+            if show_err_vecs.value and data["pred_matched"].size:
+                pm = data["pred_matched"]
+                gm = data["gt_matched"]
+                n = pm.shape[0]
+                # Use add_point_cloud-as-pairs trick: not all viser builds
+                # have add_line_segments, so render midpoints colored by error
+                # AND the endpoints as line by emitting many short splines.
+                # Cheap fallback: draw one spline per pair.
+                # Limit count for very long sequences.
+                stride = max(1, n // 200)
+                for k in range(0, n, stride):
+                    handles.append(server.scene.add_spline_catmull_rom(
+                        f"/err_vec_{v}_{scene}_{k}",
+                        positions=np.stack([pm[k], gm[k]], axis=0),
+                        color=col,
+                        line_width=max(1.5, traj_width.value * 0.5),
+                    ))
+
+    # Add stats update at end of refresh — show per-variant ATE breakdown so
+    # the user can see how "5 cm RMSE" decomposes (e.g. one big outlier vs.
+    # uniform drift).
+    _orig_refresh = refresh
+
+    def refresh_with_stats():
+        _orig_refresh()
+        scene = scene_dd.value
+        rows = ["| variant | n | mean | p50 | p90 | p99 | max | RMSE (= ATE) |",
+                "|---|---:|---:|---:|---:|---:|---:|---:|"]
+        for v, cb in variant_cbs.items():
+            if not cb.value:
+                continue
+            data = pred_cache.get((scene, v))
+            if data is None:
+                continue
+            e = data["per_frame_err"]
+            if e.size == 0:
+                continue
+            rows.append(
+                f"| {v} | {e.size} | {e.mean():.4f} | "
+                f"{np.median(e):.4f} | {np.percentile(e, 90):.4f} | "
+                f"{np.percentile(e, 99):.4f} | {e.max():.4f} | "
+                f"**{data['ate_rmse']:.4f}** |"
+            )
+        if len(rows) > 2:
+            stats_md.content = (
+                f"### {scene} — per-frame translation error (m)\n\n"
+                + "\n".join(rows)
+            )
+        else:
+            stats_md.content = f"### {scene}\n\n(no variants enabled)"
+
+    refresh = refresh_with_stats
 
     # ------------------------------------------------------------------ #
     # Wire up callbacks
     # ------------------------------------------------------------------ #
     for ctrl in (scene_dd, show_gt, show_gt_traj, show_pred_pcd,
-                 show_pred_traj, point_size, traj_width, *variant_cbs.values()):
+                 show_pred_traj, point_size, traj_width,
+                 error_view, show_err_vecs, err_clip,
+                 *variant_cbs.values()):
         ctrl.on_update(lambda _: refresh())
 
     refresh()
