@@ -28,6 +28,12 @@ class FactorGraph:
 
         self.K = K
 
+        # Phase 3: deferred loop-pointmap fusion. Each entry holds the
+        # symmetric-decode pointmaps that will be re-fused into the two
+        # keyframes' canonical, *after* both have been touched by at least one
+        # backend optimisation pass.
+        self.pending_loop_fusions = []
+
     def add_factors(self, ii, jj, min_match_frac, is_reloc=False):
         kf_ii = [self.frames[idx] for idx in ii]
         kf_jj = [self.frames[idx] for idx in jj]
@@ -134,35 +140,28 @@ class FactorGraph:
                         match_frac_j=float(mf_j_kept[b]),
                     )
 
-            # Phase 3: re-fuse the symmetric-decoded pointmaps back into each
-            # keyframe's canonical. Xji is j's pointmap in i's coord — directly
-            # compatible with keyframe_i.X_canon. We optionally gate by the
-            # SLAM-estimated baseline (skip near-zero baseline edges = consecutive
-            # KFs which already get tracking obs; loop_fuse_min_baseline_m: 0
-            # disables the gate).
+            # Phase 3: enqueue loop-pointmap fusion. The symmetric decode gives
+            #   Xij : i-grid, j-coord  → into kf_i (needs T_{i←j} transform)
+            #   Xji : j-grid, i-coord  → into kf_j (needs T_{j←i} transform)
+            # The transforms use SLAM-estimated keyframe poses, which are
+            # *drifted* on freshly added keyframes. We defer the fusion until
+            # both keyframes have had at least one backend opt pass — see
+            # FactorGraph.apply_pending_loop_fusions().
             if loop_fuse_on:
-                min_baseline = float(loop_fuse_cfg.get("min_baseline_m", 0.0))
                 exclude_consec = bool(loop_fuse_cfg.get("exclude_consecutive", False))
                 for b in range(len(kept)):
                     if exclude_consec and consec_kept[b]:
                         continue
-                    i_b = ii_kept[b]
-                    j_b = jj_kept[b]
-                    if min_baseline > 0:
-                        kf_i = self.frames[i_b]
-                        kf_j = self.frames[j_b]
-                        t_i = kf_i.T_WC.matrix()[0, :3, 3] if hasattr(kf_i.T_WC, "matrix") else kf_i.T_WC[:3, 3]
-                        t_j = kf_j.T_WC.matrix()[0, :3, 3] if hasattr(kf_j.T_WC, "matrix") else kf_j.T_WC[:3, 3]
-                        baseline = (t_i - t_j).norm().item()
-                        if baseline < min_baseline:
-                            continue
-                    # Fuse: shapes (H*W, 3) → (1, H*W, 3) to match update_pointmap
-                    Xji_b = Xji_kept[b].unsqueeze(0)
-                    Cji_b = Cji_kept[b].unsqueeze(0)
-                    Xij_b = Xij_kept[b].unsqueeze(0)
-                    Cij_b = Cij_kept[b].unsqueeze(0)
-                    self.frames[i_b].update_pointmap(Xji_b, Cji_b)
-                    self.frames[j_b].update_pointmap(Xij_b, Cij_b)
+                    self.pending_loop_fusions.append({
+                        "i": int(ii_kept[b]),
+                        "j": int(jj_kept[b]),
+                        # detach + clone so the tensors persist past this
+                        # add_factors call's GPU memory churn.
+                        "Xij": Xij_kept[b].detach().clone(),
+                        "Cij": Cij_kept[b].detach().clone(),
+                        "Xji": Xji_kept[b].detach().clone(),
+                        "Cji": Cji_kept[b].detach().clone(),
+                    })
 
             # Per-edge lightweight loop-acceptance summary (cheap).
             # We compare each kept Xji against keyframe i's stored canonical
@@ -195,6 +194,41 @@ class FactorGraph:
 
         added_new_edges = valid_edges.sum() > 0
         return added_new_edges
+
+    def apply_pending_loop_fusions(self):
+        """Phase 3: drain the pending-fusion queue for edges where both
+        keyframes have been refined by at least one backend opt pass.
+
+        The symmetric-decode pointmaps come from the decoder in different
+        coordinate frames than the destination keyframe's canonical:
+            Xij is in j's coord  → transform to i's coord  → fuse into kf_i
+            Xji is in i's coord  → transform to j's coord  → fuse into kf_j
+        The Sim3 transform uses the keyframes' SLAM-estimated poses, so we
+        only do this after both have been optimised at least once.
+        """
+        if not self.pending_loop_fusions:
+            return
+        remaining = []
+        for entry in self.pending_loop_fusions:
+            i, j = entry["i"], entry["j"]
+            kf_i = self.frames[i]
+            kf_j = self.frames[j]
+            if kf_i.n_opt_passes < 1 or kf_j.n_opt_passes < 1:
+                remaining.append(entry)
+                continue
+            # T_{i ← j} = T_WCi^-1 · T_WCj  (matches tracker.py:T_CkCf idiom)
+            T_i_from_j = kf_i.T_WC.inv() * kf_j.T_WC
+            T_j_from_i = kf_j.T_WC.inv() * kf_i.T_WC
+            # (H*W, 3) → (1, H*W, 3) for batched .act
+            Xij_b = entry["Xij"].unsqueeze(0)
+            Cij_b = entry["Cij"].unsqueeze(0)
+            Xji_b = entry["Xji"].unsqueeze(0)
+            Cji_b = entry["Cji"].unsqueeze(0)
+            Xij_in_i = T_i_from_j.act(Xij_b)
+            Xji_in_j = T_j_from_i.act(Xji_b)
+            kf_i.update_pointmap(Xij_in_i, Cij_b)
+            kf_j.update_pointmap(Xji_in_j, Cji_b)
+        self.pending_loop_fusions = remaining
 
     def get_unique_kf_idx(self):
         return torch.unique(torch.cat([self.ii, self.jj]), sorted=True)
@@ -255,6 +289,10 @@ class FactorGraph:
         # Update the keyframe T_WC
         self.frames.update_T_WCs(T_WCs[pin:], unique_kf_idx[pin:])
 
+        # Mark touched keyframes so Phase 3 fusion can use their refined pose.
+        for idx in unique_kf_idx.cpu().tolist():
+            self.frames[idx].n_opt_passes += 1
+
     def solve_GN_calib(self):
         K = self.K
         pin = self.cfg["pin"]
@@ -309,3 +347,7 @@ class FactorGraph:
 
         # Update the keyframe T_WC
         self.frames.update_T_WCs(T_WCs[pin:], unique_kf_idx[pin:])
+
+        # Mark touched keyframes so Phase 3 fusion can use their refined pose.
+        for idx in unique_kf_idx.cpu().tolist():
+            self.frames[idx].n_opt_passes += 1

@@ -40,6 +40,12 @@ class Frame:
     pos: Optional[torch.Tensor] = None
     N: int = 0
     N_updates: int = 0
+    # Count of how many backend (global-opt) passes have touched this keyframe.
+    # Used by Phase 3 to defer loop-pointmap fusion until both keyframes in an
+    # edge have had their pose refined at least once — otherwise the inter-
+    # keyframe Sim3 transform used during the fusion is built on undefer-
+    # estimated poses and the fused points land in the wrong place.
+    n_opt_passes: int = 0
     K: Optional[torch.Tensor] = None
 
     def get_score(self, C):
